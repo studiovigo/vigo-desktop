@@ -1,0 +1,4 @@
+# .gitignore para o projeto
+node_modules/
+.env.local
+.DS_Store
