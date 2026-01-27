@@ -136,6 +136,7 @@ export const supabaseDB = {
       // Garantir que model_name, color, size sejam atualizados se fornecidos
       if (updates.modelName !== undefined) {
         updatesWithStoreId.model_name = updates.modelName;
+        delete updatesWithStoreId.modelName; // Remover camelCase
       }
       if (updates.color !== undefined) {
         updatesWithStoreId.color = updates.color;
@@ -146,6 +147,7 @@ export const supabaseDB = {
       // Garantir que tax_percentage e ncm sejam atualizados se fornecidos
       if (updates.taxPercentage !== undefined) {
         updatesWithStoreId.tax_percentage = parseFloat(updates.taxPercentage) || 0;
+        delete updatesWithStoreId.taxPercentage; // Remover camelCase
       }
       if (updates.ncm !== undefined) {
         updatesWithStoreId.ncm = updates.ncm || null;
@@ -160,6 +162,25 @@ export const supabaseDB = {
         updatesWithStoreId.sale_price = updates.salePrice;
         delete updatesWithStoreId.salePrice;
       }
+      
+      // Garantir que stock_quantity também seja removido se houver stock em snake_case
+      if (updates.stock !== undefined) {
+        updatesWithStoreId.stock = updates.stock;
+      }
+      if (updates.stockQuantity !== undefined) {
+        updatesWithStoreId.stock_quantity = updates.stockQuantity;
+        delete updatesWithStoreId.stockQuantity; // Remover camelCase
+      }
+      
+      // Remover qualquer campo camelCase que ainda possa estar presente
+      const fieldsToRemove = [];
+      Object.keys(updatesWithStoreId).forEach(key => {
+        // Se a chave tem letra maiúscula (camelCase), é inválida para o Supabase
+        if (/[A-Z]/.test(key)) {
+          fieldsToRemove.push(key);
+        }
+      });
+      fieldsToRemove.forEach(key => delete updatesWithStoreId[key]);
       
       const { data, error } = await supabase
         .from('products')
@@ -1180,7 +1201,7 @@ export const supabaseDB = {
       const totalDiscounts = closure.total_discounts ?? closure.totalDiscounts ?? 0;
       const openingAmount = closure.opening_amount ?? closure.openingAmount ?? 0;
       const grossProfit = closure.gross_profit ?? closure.grossProfit ?? (totalSales - totalCosts);
-      const finalCashAmount = closure.final_cash_amount ?? closure.finalCashAmount ?? (openingAmount + totalSales - totalExpenses);
+      const finalCashAmount = closure.final_cash_amount ?? closure.finalCashAmount ?? (openingAmount + totalSales - totalCosts);
 
       const payload = {
         store_id: storeId,

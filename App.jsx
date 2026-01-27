@@ -21,6 +21,7 @@ import { supabaseDB } from "./services/supabaseDB";
 import { resolveStoreId, enqueuePendingSale, syncPendingSalesQueue, startPendingSalesWorker, getPendingSalesCount } from "./services/supabaseSync";
 import { useClosureMetrics } from "./services/useDashboardMetrics";
 import GoodAdmin from "./components/GoodAdmin";
+import shopifyService, { setShopifyCredentials, loadStoredCredentials, graphql as shopifyGraphql, getProductsREST as shopifyGetProductsREST } from './services/shopify';
 // import RevenueChart from "./components/RevenueChart"; // Será ativado após instalar recharts
 
 
@@ -1017,7 +1018,7 @@ function SettingsPage({ user }) {
   // Forms
   const [newUser, setNewUser] = useState({ name: "", cpf: "", password: "", role: "caixa", store_id: "" });
   const [newCoupon, setNewCoupon] = useState({ code: "", discount: "" });
-  const [settings, setSettings] = useState({ cnpj: "" });
+  const [settings, setSettings] = useState({ cnpj: "", shopifyStore: "", shopifyAccessToken: "", shopifyApiVersion: "2024-01" });
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [userToDelete, setUserToDelete] = useState(null);
   const [deletePassword, setDeletePassword] = useState("");
@@ -1072,7 +1073,20 @@ function SettingsPage({ user }) {
 
   useEffect(() => {
     refreshData();
-    setSettings(db.settings.get());
+    // Carregar configurações locais
+    setSettings(prev => ({ ...prev, ...db.settings.get() }));
+    // Carregar credenciais Shopify salvas no navegador
+    try {
+      const creds = loadStoredCredentials();
+      setSettings(prev => ({
+        ...prev,
+        shopifyStore: creds.store || prev.shopifyStore || "",
+        shopifyAccessToken: creds.accessToken || prev.shopifyAccessToken || "",
+        shopifyApiVersion: creds.apiVersion || prev.shopifyApiVersion || "2024-01"
+      }));
+    } catch (e) {
+      // ignore
+    }
     if (isGoodAdmin) {
       loadPendingSignups();
     }
@@ -1123,6 +1137,51 @@ function SettingsPage({ user }) {
     e.preventDefault();
     db.settings.update(settings, user);
     alert("Configurações salvas com sucesso!");
+  };
+
+  // Salvar credenciais Shopify no runtime/localStorage
+  const handleSaveShopifyCredentials = async () => {
+    try {
+      setShopifyCredentials({
+        store: (settings.shopifyStore || '').trim(),
+        accessToken: (settings.shopifyAccessToken || '').trim(),
+        apiVersion: (settings.shopifyApiVersion || '2024-01').trim()
+      });
+      alert('Credenciais da Shopify salvas!');
+    } catch (e) {
+      alert('Erro ao salvar credenciais: ' + (e?.message || e));
+    }
+  };
+
+  // Testar conexão (GraphQL shop name)
+  const [shopifyTestLoading, setShopifyTestLoading] = useState(false);
+  const handleTestShopifyConnection = async () => {
+    setShopifyTestLoading(true);
+    try {
+      const query = `query { shop { name myshopifyDomain } }`;
+      const res = await shopifyGraphql(query);
+      const name = res?.data?.shop?.name;
+      const domain = res?.data?.shop?.myshopifyDomain;
+      alert(`Conexão OK! Loja: ${name} (${domain})`);
+    } catch (e) {
+      console.error('[Shopify] Teste falhou:', e);
+      alert('Falha na conexão Shopify. Verifique Store e Access Token.');
+    } finally {
+      setShopifyTestLoading(false);
+    }
+  };
+
+  // Listar alguns produtos via REST
+  const handleListShopifyProducts = async () => {
+    try {
+      const json = await shopifyGetProductsREST({ limit: 5 });
+      const products = json?.products || [];
+      alert(`Produtos recebidos: ${products.length}`);
+      console.log('[Shopify] Exemplos de produtos:', products);
+    } catch (e) {
+      console.error('[Shopify] Produtos falharam:', e);
+      alert('Erro ao listar produtos. Verifique permissões read_products.');
+    }
   };
 
   const formatCnpj = (value) => {
@@ -1635,16 +1694,43 @@ function SettingsPage({ user }) {
             <div className="border-t pt-4 mt-4">
               <h4 className="font-bold mb-3 text-lg">Integração Shopify</h4>
               <div className="space-y-4">
+                <div className="grid md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-sm font-bold mb-2">Domínio da Loja (myshopify.com)</label>
+                    <Input 
+                      placeholder="lb-brand-6997.myshopify.com" 
+                      value={settings.shopifyStore || ""}
+                      onChange={e => setSettings({ ...settings, shopifyStore: e.target.value })}
+                      className="w-full rounded-lg"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">Ex: sua-loja.myshopify.com</p>
+                  </div>
+                  <div>
+                    <label className="block text-sm font-bold mb-2">API Version</label>
+                    <Input 
+                      placeholder="2024-01" 
+                      value={settings.shopifyApiVersion || "2024-01"}
+                      onChange={e => setSettings({ ...settings, shopifyApiVersion: e.target.value })}
+                      className="w-full rounded-lg"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">Versão da API admin</p>
+                  </div>
+                </div>
                 <div>
-                  <label className="block text-sm font-bold mb-2">API Key da Shopify</label>
+                  <label className="block text-sm font-bold mb-2">Access Token (Admin)</label>
                   <Input 
                     type="password"
                     placeholder="shpat_xxxxxxxxxxxxx" 
-                    value={settings.shopifyApiKey || ""}
-                    onChange={e => setSettings({ ...settings, shopifyApiKey: e.target.value })}
+                    value={settings.shopifyAccessToken || ""}
+                    onChange={e => setSettings({ ...settings, shopifyAccessToken: e.target.value })}
                     className="w-full rounded-lg"
                   />
-                  <p className="text-xs text-gray-500 mt-1">Chave de API da sua loja Shopify</p>
+                  <p className="text-xs text-gray-500 mt-1">Gerado ao instalar seu app no Dev Dashboard</p>
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  <Button type="button" variant="primary" className="rounded-full" onClick={handleSaveShopifyCredentials}>Salvar Credenciais Shopify</Button>
+                  <Button type="button" variant="outline" className="rounded-full" onClick={handleTestShopifyConnection} disabled={shopifyTestLoading}>{shopifyTestLoading ? 'Testando...' : 'Testar Conexão'}</Button>
+                  <Button type="button" variant="outline" className="rounded-full" onClick={handleListShopifyProducts}>Listar 5 Produtos</Button>
                 </div>
                 <div>
                   <label className="block text-sm font-bold mb-2">URL do Webhook</label>
@@ -1949,6 +2035,10 @@ function POS({ user }) {
       alert('Erro: Nenhum caixa aberto. Abra o caixa antes de realizar vendas.');
       return;
     }
+
+    // Obter usuário logado do localStorage (fallback quando state não está acessível aqui)
+    const loggedUserStr = localStorage.getItem('mozyc_pdv_current_user');
+    const loggedUser = loggedUserStr ? JSON.parse(loggedUserStr) : null;
     
     console.log('[finish] Preparando items da venda...');
     
@@ -1983,7 +2073,9 @@ function POS({ user }) {
       total_amount: totalFinal, 
       payment_method: finalPaymentMethod,
       discount: discountAmount,
-      cashRegisterId: cash.id // VÍNCULO COM O CAIXA ATUAL
+      cashRegisterId: cash.id, // VÍNCULO COM O CAIXA ATUAL
+      user_name: (loggedUser?.name || loggedUser?.email?.split('@')[0] || 'Usuário'), // Nome do usuário logado
+      user_id: (loggedUser?.id ?? null) // ID do usuário logado
     };
     
     console.log('[finish] Sale data preparado:', saleData);
@@ -2135,6 +2227,10 @@ function POS({ user }) {
       const profit_amount = total_net - total_cost;
       const metadata = { items: (saleData.items || []).map(i => ({ sku: i.sku || i.code, product_id: i.product_id, quantity: i.quantity, price: i.price || i.unit_price || i.unitPrice })) };
 
+      // Obter usuário logado do localStorage para complementar dados da venda
+      const loggedUserStr = localStorage.getItem('mozyc_pdv_current_user');
+      const loggedUser = loggedUserStr ? JSON.parse(loggedUserStr) : null;
+
       createdSale = {
         ...saleData,
         id: result.sale_id,
@@ -2147,7 +2243,9 @@ function POS({ user }) {
         discount_amount,
         items_count,
         metadata,
-        status: 'finalized'
+        status: 'finalized',
+        user_name: saleData.user_name || loggedUser?.name || loggedUser?.email?.split('@')[0] || 'Usuário',
+        user_id: saleData.user_id || (loggedUser?.id ?? null)
       };
       
       // Sincronizar produtos do Supabase para pegar estoque atualizado pela RPC
@@ -6309,25 +6407,74 @@ function Reports({ user }) {
     </Card>
   );
 
-  const resolveCashierName = (sale, userLookup = {}) => {
+  const resolveCashierName = (sale, userLookup = {}, cashRegisterMap = {}) => {
     const saleUserId = sale.user_id || sale.userId || sale.userID || sale.user;
-    return (
+    const fallbackName = (
       sale.created_by ||
+      sale.user_name || // Priorizar user_name que agora é preenchido
       sale.cashier_name ||
       sale.user_name ||
       sale.userName ||
       sale.seller_name ||
       sale.operator_name ||
       (saleUserId ? userLookup[saleUserId] : null) ||
-      (saleUserId ? `Usuário ${String(saleUserId).slice(0, 6)}` : 'Caixa')
+      (saleUserId ? `Usuário ${String(saleUserId).slice(0, 6)}` : null)
     );
+    
+    // Se temos um nome, usar ele
+    if (fallbackName) {
+      return fallbackName;
+    }
+    
+    // Caso contrário, tentar usar o cashRegisterId para gerar um identificador
+    const cashRegisterId = sale.cashRegisterId || sale.cash_register_id || sale.pos_id;
+    if (cashRegisterId && cashRegisterMap[cashRegisterId]) {
+      return cashRegisterMap[cashRegisterId];
+    }
+    
+    // Fallback final
+    return 'Caixa';
   };
 
   const buildCashierBreakdown = (sales = [], cancelled = [], userLookup = {}) => {
     const map = {};
 
+    // Função auxiliar para verificar se uma venda tem um nome atribuído
+    const hasCashierName = (sale) => {
+      return !!(
+        sale.created_by ||
+        sale.cashier_name ||
+        sale.user_name ||
+        sale.userName ||
+        sale.seller_name ||
+        sale.operator_name ||
+        ((sale.user_id || sale.userId || sale.userID || sale.user) && userLookup[(sale.user_id || sale.userId || sale.userID || sale.user)])
+      );
+    };
+
+    // Criar mapa de cashRegisterIds únicos para numeração (CAIXA 1, CAIXA 2, etc)
+    // Apenas para vendas sem nome atribuído
+    const uniqueCashRegisterIds = new Set();
+    const allSalesAndCancelled = [...sales, ...cancelled];
+    
+    allSalesAndCancelled.forEach(sale => {
+      if (!hasCashierName(sale)) {
+        const cashRegisterId = sale.cashRegisterId || sale.cash_register_id || sale.pos_id;
+        if (cashRegisterId) {
+          uniqueCashRegisterIds.add(cashRegisterId);
+        }
+      }
+    });
+    
+    // Criar mapa de cashRegisterId -> "CAIXA N"
+    const cashRegisterMap = {};
+    const sortedIds = Array.from(uniqueCashRegisterIds).sort();
+    sortedIds.forEach((id, index) => {
+      cashRegisterMap[id] = `CAIXA ${index + 1}`;
+    });
+
     const accumulate = (sale, factor) => {
-      const name = resolveCashierName(sale, userLookup);
+      const name = resolveCashierName(sale, userLookup, cashRegisterMap);
       const amount = (sale.total_amount || 0) * factor;
       const method = sale.payment_method || 'money';
 
@@ -7032,7 +7179,8 @@ function Reports({ user }) {
         supabaseProducts.forEach(p => {
           productsMap[p.id] = p.cost_price || p.costPrice || 0;
         });
-        console.log('[confirmCloseCash] Produtos carregados:', Object.keys(productsMap).length);
+        console.log('[confirmCloseCash] ✅ Produtos carregados:', Object.keys(productsMap).length);
+        console.log('[confirmCloseCash] 📦 Mapa de Produtos:', productsMap);
       }
     } catch (error) {
       console.error('[confirmCloseCash] Erro ao buscar produtos:', error);
@@ -7041,6 +7189,7 @@ function Reports({ user }) {
       localProducts.forEach(p => {
         productsMap[p.id] = p.cost_price || p.costPrice || 0;
       });
+      console.log('[confirmCloseCash] ⚠️ Usando fallback localStorage, produtos:', Object.keys(productsMap).length);
     }
 
     salesOfCurrentCash.forEach(sale => {
@@ -7056,11 +7205,15 @@ function Reports({ user }) {
 
       // Calcular custos dos itens vendidos
       const items = sale.items || [];
+      console.log(`[confirmCloseCash] 🧾 Venda ${sale.id}: ${items.length} itens`);
       items.forEach(item => {
         const costPrice = productsMap[item.product_id] || 0;
-        totalCosts += (costPrice * item.quantity);
+        const itemCost = costPrice * item.quantity;
+        console.log(`[confirmCloseCash]   - Produto ${item.product_id}: custo unitário R$ ${costPrice}, qtd ${item.quantity}, subtotal R$ ${itemCost}`);
+        totalCosts += itemCost;
       });
     });
+    console.log(`[confirmCloseCash] 💰 Total de Custos Calculado: R$ ${totalCosts}`);
 
     // Descontar cancelamentos
     cancelledOfCurrentCash.forEach(sale => {
@@ -8098,7 +8251,33 @@ function Online({ user }) {
   }, []);
 
   const refreshOrders = () => {
-    setOrders(db.onlineOrders.list());
+    const existing = db.onlineOrders.list() || [];
+    if (!existing || existing.length === 0) {
+      const demoOrder = {
+        id: 'DEMO-ORDER-001',
+        isDemo: true,
+        status: 'aguardo',
+        customerName: 'Maria Exemplo',
+        orderNumber: '1001',
+        createdAt: new Date().toISOString(),
+        productName: 'Camiseta Básica Preto',
+        productCode: 'SKU-DEMO-001',
+        quantity: 1,
+        totalAmount: 89.9,
+        paymentMethod: 'Cartão (Visa) - Aprovado',
+        shippingAddress: {
+          street: 'Rua das Flores',
+          number: '123',
+          neighborhood: 'Centro',
+          city: 'São Paulo',
+          state: 'SP',
+          zipCode: '01000-000'
+        }
+      };
+      setOrders([demoOrder]);
+    } else {
+      setOrders(existing);
+    }
   };
 
   const updateOrderStatus = (orderId, newStatus) => {
@@ -8198,6 +8377,9 @@ function Online({ user }) {
                       <p className="text-sm text-gray-500">
                         Pedido #{order.orderNumber || order.id.slice(0, 8).toUpperCase()}
                       </p>
+                      {order.isDemo && (
+                        <p className="text-xs font-bold text-orange-600">Pedido de exemplo (mostruário)</p>
+                      )}
                       <p className="text-xs text-gray-400">
                         {order.createdAt ? new Date(order.createdAt).toLocaleString('pt-BR') : ""}
                       </p>
@@ -8253,11 +8435,12 @@ function Online({ user }) {
                     <Button
                       variant="outline"
                       className="rounded-full text-sm"
-                      onClick={() => printShippingLabel(order)}
+                      disabled={order.isDemo}
+                      onClick={() => { if (!order.isDemo) printShippingLabel(order); }}
                     >
                       <Printer size={14} className="mr-1"/> Imprimir Etiqueta
                     </Button>
-                    {order.status !== "aguardo" && (
+                    {!order.isDemo && order.status !== "aguardo" && (
                       <Button
                         variant="outline"
                         className="rounded-full text-sm"
@@ -8266,7 +8449,7 @@ function Online({ user }) {
                         Marcar como Aguardo
                       </Button>
                     )}
-                    {order.status !== "processo" && (
+                    {!order.isDemo && order.status !== "processo" && (
                       <Button
                         variant="outline"
                         className="rounded-full text-sm"
@@ -8275,7 +8458,7 @@ function Online({ user }) {
                         Marcar como Processo
                       </Button>
                     )}
-                    {order.status !== "entregue" && (
+                    {!order.isDemo && order.status !== "entregue" && (
                       <Button
                         variant="primary"
                         className="rounded-full text-sm"

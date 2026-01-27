@@ -1,7 +1,22 @@
 // Função para processar webhook da Shopify e criar pedido no sistema
-import { db } from "./db";
+import { db } from "./db.js";
+import { supabaseDB } from "./supabaseDB.js";
+import crypto from "crypto";
 
-export function processShopifyWebhook(webhookData) {
+function mapPaymentMethod(order) {
+  const status = (order.financial_status || '').toLowerCase();
+  const gateways = Array.isArray(order.payment_gateway_names) ? order.payment_gateway_names.map(g => g.toLowerCase()) : [];
+  // Mapeamento simples para os métodos suportados no sistema
+  if (status === 'paid') {
+    if (gateways.some(g => g.includes('pix'))) return 'pix_direto';
+    if (gateways.some(g => g.includes('debit'))) return 'debit';
+    if (gateways.some(g => g.includes('credit') || g.includes('visa') || g.includes('mastercard') || g.includes('amex'))) return 'credit';
+    return 'credit';
+  }
+  return 'money';
+}
+
+export async function processShopifyWebhook(webhookData, topic = 'unknown', shopDomain = '') {
   try {
     // Extrair dados do webhook da Shopify
     // Formato esperado do webhook da Shopify (order/paid ou order/created)
@@ -28,15 +43,29 @@ export function processShopifyWebhook(webhookData) {
     
     // Extrair itens do pedido
     const lineItems = order.line_items || [];
-    const items = lineItems.map(item => {
+    const items = await Promise.all(lineItems.map(async item => {
       // Tentar encontrar produto no sistema pelo SKU ou código
       const productCode = item.sku || item.variant_id?.toString() || "";
-      const product = db.products.findByCode(productCode) || 
+      let product = db.products.findByCode(productCode) || 
                      db.products.list().find(p => 
                        p.code === productCode || 
                        p.code?.includes(productCode) ||
                        productCode.includes(p.code)
                      );
+      // Tentar também no Supabase para obter product_id
+      let productId = null;
+      try {
+        const sbdProduct = await supabaseDB.products.findByCode(productCode);
+        if (sbdProduct) {
+          productId = sbdProduct.id;
+          // se local não tiver, criar referência mínima
+          if (!product) {
+            product = { id: sbdProduct.id, name: sbdProduct.name, stock: sbdProduct.stock, code: sbdProduct.sku };
+          }
+        }
+      } catch (e) {
+        // ignore
+      }
       
       // Se encontrou o produto, atualizar estoque
       if (product) {
@@ -57,10 +86,11 @@ export function processShopifyWebhook(webhookData) {
         code: productCode,
         sku: item.sku || "",
         quantity: item.quantity || 1,
-        price: parseFloat(item.price || 0),
-        image: item.image?.src || item.variant?.image || ""
+        price: parseFloat(item.price || item.price_set?.shop_money?.amount || 0),
+        image: item.image?.src || item.variant?.image || "",
+        product_id: productId || product?.id || null
       };
-    });
+    }));
     
     // Se houver apenas um item, usar dados simplificados
     const firstItem = items[0] || {};
@@ -75,7 +105,7 @@ export function processShopifyWebhook(webhookData) {
       productImage: firstItem.image || "",
       quantity: firstItem.quantity || order.line_items?.[0]?.quantity || 1,
       totalAmount: parseFloat(order.total_price || order.total || 0),
-      paymentMethod: order.financial_status === "paid" ? "Pago" : order.payment_gateway_names?.[0] || "Pendente",
+      paymentMethod: mapPaymentMethod(order),
       shippingAddress: formattedAddress,
       items: items,
       status: "aguardo",
@@ -90,6 +120,33 @@ export function processShopifyWebhook(webhookData) {
       role: "admin"
     });
     
+    // Se foi pagamento do pedido, criar venda no Supabase
+    if ((topic || '').includes('orders/paid')) {
+      try {
+        const external_id = (order.id ? `shopify-${order.id}` : crypto.randomUUID());
+        const saleData = {
+          items: items.map(it => ({
+            product_id: it.product_id,
+            quantity: it.quantity,
+            code: it.code,
+            sku: it.sku,
+            name: it.name,
+            price: it.price,
+          })),
+          total_amount: parseFloat(order.total_price || 0),
+          payment_method: mapPaymentMethod(order),
+          status: 'finalized'
+        };
+        const result = await supabaseDB.sales.callCreateSaleAtomic(saleData, external_id);
+        if (result.status === 'ok' && result.sale_id) {
+          // vincular o pedido online à venda
+          await db.onlineOrders.update(savedOrder.id, { saleId: result.sale_id, status: 'processo' }, { name: 'Sistema', cpf: '00000000000', role: 'admin' });
+        }
+      } catch (err) {
+        console.error('Erro ao criar venda no Supabase via webhook:', err);
+      }
+    }
+    
     return { success: true, order: savedOrder };
   } catch (error) {
     console.error("Erro ao processar webhook da Shopify:", error);
@@ -102,8 +159,10 @@ export function createWebhookEndpoint() {
   // Esta função pode ser usada em um servidor Node.js/Express
   // Exemplo:
   /*
-  app.post('/webhook/shopify', (req, res) => {
-    const result = processShopifyWebhook(req.body);
+  app.post('/webhook/shopify', async (req, res) => {
+    const topic = req.get('X-Shopify-Topic') || 'unknown';
+    const shop = req.get('X-Shopify-Shop-Domain') || '';
+    const result = await processShopifyWebhook(req.body, topic, shop);
     if (result.success) {
       res.status(200).json({ success: true });
     } else {
