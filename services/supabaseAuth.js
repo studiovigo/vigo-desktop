@@ -34,6 +34,9 @@ export async function loginWithEmail(email, password) {
       .eq('id', data.user.id)
       .maybeSingle();
 
+    console.log('[Supabase Auth] Profile data:', profile);
+    console.log('[Supabase Auth] Profile error:', profileError);
+
     if (profileError) {
       console.error('[Supabase Auth] Erro ao buscar perfil:', profileError);
       

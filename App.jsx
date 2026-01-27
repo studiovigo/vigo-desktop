@@ -18,9 +18,9 @@ import { format } from "date-fns";
 import { testSupabaseConnection } from "./services/testSupabaseConnection";
 import { supabase } from "./services/supabaseClient";
 import { supabaseDB } from "./services/supabaseDB";
+import { Html5QrcodeScanner } from "html5-qrcode";
 import { resolveStoreId, enqueuePendingSale, syncPendingSalesQueue, startPendingSalesWorker, getPendingSalesCount } from "./services/supabaseSync";
 import { useClosureMetrics } from "./services/useDashboardMetrics";
-import GoodAdmin from "./components/GoodAdmin";
 import shopifyService, { setShopifyCredentials, loadStoredCredentials, graphql as shopifyGraphql, getProductsREST as shopifyGetProductsREST } from './services/shopify';
 // import RevenueChart from "./components/RevenueChart"; // Será ativado após instalar recharts
 
@@ -527,8 +527,8 @@ function Login({ onLogin }) {
           user.role = 'caixa'; // Default
         }
         // Calcular e atribuir tenantId
-        if ((user.role === 'admin' || user.role === 'goodadmin') && user.email) {
-          // ADMIN/GOODADMIN usa email como tenantId
+        if (user.role === 'admin' && user.email) {
+          // ADMIN usa email como tenantId
           user.tenantId = user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
         } else if (!user.tenantId) {
           // GERENTE/CAIXA herda tenantId do admin que os criou
@@ -806,6 +806,8 @@ function Layout({ children, user, onLogout }) {
   const loc = useLocation();
   const navigate = useNavigate();
 
+  console.log('[Layout Debug] user:', user);
+  console.log('[Layout Debug] user.role:', user?.role);
 
   // Menu baseado em permissões
   const getMenuItems = () => {
@@ -822,6 +824,7 @@ function Layout({ children, user, onLogout }) {
   };
 
   const menu = getMenuItems();
+  console.log('[Layout Debug] menu items:', menu.length, menu);
 
 
   return (
@@ -871,11 +874,11 @@ function Layout({ children, user, onLogout }) {
               );
             })}
           </nav>
-          <div className="relative group">
+          <div className="relative group hidden md:block">
             <button
               onClick={onLogout}
               className="
-                hidden md:flex items-center justify-center
+                flex items-center justify-center
                 w-10 h-10 rounded-full
                 bg-slate-100 text-red-500
                 hover:bg-red-50
@@ -1023,8 +1026,8 @@ function SettingsPage({ user }) {
   const [userToDelete, setUserToDelete] = useState(null);
   const [deletePassword, setDeletePassword] = useState("");
 
-  // Verificar se é GoodAdmin
-  const isGoodAdmin = user?.email === 'good@admin.com' || user?.email?.toLowerCase() === 'good' || user?.role === 'goodadmin';
+  // Verificar se é Admin
+  const isGoodAdmin = user?.role === 'admin';
 
   // Função auxiliar para verificar senha do usuário logado (apenas Supabase)
   const verifyUserPassword = async (password) => {
@@ -1477,7 +1480,7 @@ function SettingsPage({ user }) {
                   <div>
                     <p className="font-bold text-[#d9b53f]">{user.name || 'Usuário Atual'}</p>
                     <p className="text-xs text-slate-600">
-                      {user.role === 'admin' ? 'Administrador' : user.role === 'gerente' ? 'Gerente' : user.role === 'goodadmin' ? 'Good Admin' : 'Caixa'} 
+                      {user.role === 'admin' ? 'Administrador' : user.role === 'gerente' ? 'Gerente' : 'Caixa'} 
                       {user.cpf && ` | ${user.cpf.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, '$1.$2.$3-$4')}`}
                       {user.email && ` | ${user.email}`}
                     </p>
@@ -1494,19 +1497,19 @@ function SettingsPage({ user }) {
                   (u.email !== user?.email || !user?.email) &&
                   // Remover usuário padrão "Adriano Admin"
                   u.email !== 'admin@lbbrand.com' &&
-                  u.name !== 'Adriano Admin'
+                  u.name !== 'Luana Admin'
                 )
                 .map(u => (
                 <div key={u.id} className="flex justify-between items-center border-b p-2 rounded-lg">
                   <div>
                     <p className="font-bold">{u.name}</p>
                     <p className="text-xs text-slate-500">
-                      {u.role === 'admin' ? 'Administrador' : u.role === 'gerente' ? 'Gerente' : u.role === 'goodadmin' ? 'Good Admin' : 'Caixa'} 
+                      {u.role === 'admin' ? 'Administrador' : u.role === 'gerente' ? 'Gerente' : 'Caixa'} 
                       {u.cpf && ` | ${u.cpf.replace(/(\d{3})(\d{3})(\d{3})(\d{2})/, '$1.$2.$3-$4')}`}
                       {u.email && ` | ${u.email}`}
                     </p>
                   </div>
-                  {u.role !== 'admin' && u.role !== 'goodadmin' && (user.role === 'admin' || user.role === 'gerente' || user.role === 'goodadmin') && (
+                  {u.role !== 'admin' && (user.role === 'admin' || user.role === 'gerente') && (
                     <button 
                       onClick={() => handleDeleteUser(u)} 
                       className="text-red-500 hover:text-red-700 rounded-lg p-1"
@@ -1791,7 +1794,7 @@ function POS({ user }) {
     }
   });
   const [term, setTerm] = useState("");
-  const [cam, setCam] = useState(false);
+  const [showBarcodeScanner, setShowBarcodeScanner] = useState(false);
   const barcodeInputRef = useRef(null);
   const barcodeTimeoutRef = useRef(null);
   const lastBarcodeValueRef = useRef("");
@@ -2596,7 +2599,7 @@ function POS({ user }) {
         <Card className="p-4 flex gap-2 rounded-xl flex-shrink-0">
           <Input 
             ref={barcodeInputRef}
-            placeholder={cam ? "Modo leitor ativo - Escaneie o código de barras..." : "Buscar produto ou código de barras..."} 
+            placeholder="Buscar produto ou escanear código de barras (BIP)..." 
             value={term} 
             onChange={(e) => {
               const value = e.target.value;
@@ -2608,16 +2611,16 @@ function POS({ user }) {
                 clearTimeout(barcodeTimeoutRef.current);
               }
               
-              // Se o modo leitor está ativo e há um código (mínimo 3 caracteres)
-              // Aguarda um pouco para ver se mais caracteres vêm (leitura rápida do leitor)
-              if (cam && value.length >= 3) {
+              // Detecta leitura de código de barras (leitores digitam muito rápido)
+              // Se há um código (mínimo 3 caracteres), aguarda um pouco para processar
+              if (value.length >= 3) {
                 barcodeTimeoutRef.current = setTimeout(() => {
                   // Se o valor não mudou, significa que a leitura terminou
                   const currentValue = barcodeInputRef.current?.value || lastBarcodeValueRef.current;
                   if (currentValue === value && value.length >= 3) {
                     processBarcode(value);
                   }
-                }, 200); // 200ms de delay para capturar leituras rápidas
+                }, 200); // 200ms de delay para capturar leituras rápidas do BIP
               }
             }}
             onKeyDown={(e) => {
@@ -2636,27 +2639,13 @@ function POS({ user }) {
           />
           <Button 
             onClick={() => {
-              const newCamState = !cam;
-              setCam(newCamState);
-              // Foca no campo de código quando ativa o modo leitor
-              if (newCamState) {
-                setTimeout(() => {
-                  barcodeInputRef.current?.focus();
-                  setTerm(''); // Limpa o campo ao ativar
-                }, 100);
-              } else {
-                // Limpa timeout se desativar
-                if (barcodeTimeoutRef.current) {
-                  clearTimeout(barcodeTimeoutRef.current);
-                }
-              }
+              setShowBarcodeScanner(true);
             }} 
-            variant={cam ? "danger" : "primary"}
-            className={`rounded-full ${cam ? 'animate-pulse' : ''}`}
-            title={cam ? "Desativar leitor de código de barras (Clique para desativar)" : "Ativar leitor de código de barras (Clique para ativar)"}
+            variant="primary"
+            className="rounded-full"
+            title="Abrir câmera para escanear código de barras"
           >
             <Camera size={20}/>
-            {cam && <span className="ml-2 text-xs">Ativo</span>}
           </Button>
         </Card>
 
@@ -3078,6 +3067,260 @@ function POS({ user }) {
           </Card>
         </div>
       )}
+
+      {/* Modal Scanner de Código de Barras */}
+      {showBarcodeScanner && (
+        <BarcodeScannerModal 
+          onClose={() => setShowBarcodeScanner(false)}
+          onScan={(code) => {
+            processBarcode(code);
+            setShowBarcodeScanner(false);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// Componente Modal de Scanner de Código de Barras
+function BarcodeScannerModal({ onClose, onScan }) {
+  const [error, setError] = useState(null);
+  const [isLoading, setIsLoading] = useState(true);
+  const scannerInstanceRef = useRef(null);
+
+  useEffect(() => {
+    let isMounted = true;
+
+    const initScanner = async () => {
+      try {
+        const scanner = new Html5QrcodeScanner(
+          "barcode-reader",
+          { 
+            fps: 10,
+            qrbox: { width: 400, height: 200 },
+            formatsToSupport: [
+              0, // CODE_128
+              1, // CODE_39
+              2, // EAN_13
+              3, // EAN_8
+              4, // ITF
+              5, // UPC_A
+              6, // UPC_E
+              8, // RSS_14
+              9, // CODABAR
+            ],
+            aspectRatio: 1.777778,
+            disableFlip: false,
+            showTorchButtonIfSupported: true,
+            rememberLastUsedCamera: true,
+          },
+          false
+        );
+
+        scannerInstanceRef.current = scanner;
+
+        scanner.render(
+          (decodedText) => {
+            if (isMounted) {
+              console.log(`[Scanner] Código detectado: ${decodedText}`);
+              scanner.clear().then(() => {
+                onScan(decodedText);
+              }).catch(console.error);
+            }
+          },
+          (errorMessage) => {
+            // Ignora erros normais de scanning
+            if (!errorMessage.includes('NotFoundException') && 
+                !errorMessage.includes('No MultiFormat Readers')) {
+              console.warn(`[Scanner] ${errorMessage}`);
+            }
+          }
+        );
+
+        if (isMounted) {
+          setIsLoading(false);
+        }
+      } catch (err) {
+        console.error('[Scanner] Erro ao inicializar:', err);
+        if (isMounted) {
+          setError('Erro ao acessar a câmera. Verifique as permissões.');
+          setIsLoading(false);
+        }
+      }
+    };
+
+    // Pequeno delay para garantir que o DOM está pronto
+    const timeout = setTimeout(() => {
+      initScanner();
+    }, 100);
+
+    return () => {
+      isMounted = false;
+      clearTimeout(timeout);
+      if (scannerInstanceRef.current) {
+        scannerInstanceRef.current.clear().catch(console.error);
+      }
+    };
+  }, [onScan]);
+
+  // ESC para fechar
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        onClose();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [onClose]);
+
+  return (
+    <div 
+      className="fixed inset-0 bg-black/90 flex items-center justify-center z-[80] p-4"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) {
+          onClose();
+        }
+      }}
+    >
+      <Card className="w-full max-w-3xl p-6 rounded-2xl shadow-2xl" onClick={(e) => e.stopPropagation()}>
+        {/* Header */}
+        <div className="flex justify-between items-center mb-6">
+          <div>
+            <h2 className="text-2xl font-bold text-gray-800">Escanear Código de Barras</h2>
+            <p className="text-sm text-gray-500 mt-1">Use a câmera para ler códigos de produtos</p>
+          </div>
+          <Button 
+            variant="outline" 
+            onClick={onClose}
+            className="rounded-full w-10 h-10 p-0 text-xl hover:bg-red-50 hover:text-red-600"
+          >
+            ✕
+          </Button>
+        </div>
+
+        {/* Instruções */}
+        <div className="mb-6 p-4 bg-gradient-to-r from-amber-50 to-yellow-50 border-l-4 border-yellow-500 rounded-lg">
+          <div className="flex items-start gap-3">
+            <div className="text-3xl">📷</div>
+            <div>
+              <p className="text-sm font-semibold text-yellow-900 mb-1">
+                Como usar:
+              </p>
+              <ul className="text-xs text-yellow-800 space-y-1">
+                <li>• Permita o acesso à câmera quando solicitado</li>
+                <li>• Posicione o código de barras horizontalmente</li>
+                <li>• Mantenha uma distância de 10-20cm da câmera</li>
+                <li>• Aguarde a leitura automática</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        {/* Loading */}
+        {isLoading && (
+          <div className="mb-4 p-6 bg-gray-50 border border-gray-200 rounded-xl text-center">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-yellow-500 mx-auto mb-3"></div>
+            <p className="text-sm text-gray-600">Iniciando câmera...</p>
+          </div>
+        )}
+
+        {/* Error */}
+        {error && (
+          <div className="mb-4 p-4 bg-red-50 border-l-4 border-red-500 rounded-lg">
+            <p className="text-sm text-red-800 font-medium">{error}</p>
+            <p className="text-xs text-red-600 mt-1">
+              Certifique-se de que o navegador tem permissão para acessar a câmera.
+            </p>
+          </div>
+        )}
+
+        {/* Scanner Container */}
+        <div className="mb-6 bg-gray-900 rounded-xl overflow-hidden shadow-inner">
+          <div id="barcode-reader" className="min-h-[300px]" />
+          <style>{`
+            #barcode-reader {
+              background: #1f2937 !important;
+            }
+            #barcode-reader__dashboard_section {
+              text-align: center !important;
+            }
+            #barcode-reader__dashboard_section_csr button,
+            #barcode-reader__dashboard_section_fsr button {
+              color: white !important;
+              background: #d9b53f !important;
+              border: none !important;
+              padding: 12px 24px !important;
+              border-radius: 8px !important;
+              font-weight: 500 !important;
+              margin: 8px auto !important;
+              display: block !important;
+            }
+            #barcode-reader__dashboard_section_csr button:hover,
+            #barcode-reader__dashboard_section_fsr button:hover {
+              background: #bf9035 !important;
+            }
+            #barcode-reader__scan_region {
+              border: 2px solid #d9b53f !important;
+              border-radius: 12px !important;
+            }
+            #barcode-reader video {
+              border-radius: 8px !important;
+            }
+            #barcode-reader__header_message {
+              color: white !important;
+              text-align: center !important;
+              padding: 16px !important;
+              font-size: 14px !important;
+            }
+            #barcode-reader__camera_permission_button {
+              color: white !important;
+              background: #d9b53f !important;
+              border: none !important;
+              padding: 12px 32px !important;
+              border-radius: 8px !important;
+              font-weight: 600 !important;
+              margin: 16px auto !important;
+              display: block !important;
+            }
+            #barcode-reader__camera_permission_button:hover {
+              background: #bf9035 !important;
+            }
+            /* Estilizar ícone e texto */
+            #barcode-reader img,
+            #barcode-reader svg {
+              filter: brightness(0) invert(1) !important;
+              margin: 0 auto !important;
+            }
+            #barcode-reader span,
+            #barcode-reader p,
+            #barcode-reader div:not(#barcode-reader__scan_region) {
+              color: white !important;
+              text-align: center !important;
+            }
+            #barcode-reader a {
+              color: #d9b53f !important;
+              text-align: center !important;
+              display: block !important;
+              margin: 8px auto !important;
+            }
+          `}</style>
+        </div>
+
+        {/* Footer */}
+        <div className="flex justify-between items-center pt-4 border-t">
+          <p className="text-xs text-gray-500">
+            Formatos suportados: EAN-13, CODE-128, CODE-39, UPC-A
+          </p>
+          <Button 
+            variant="outline" 
+            onClick={onClose}
+            className="rounded-full px-6"
+          >
+            Fechar (ESC)
+          </Button>
+        </div>
+      </Card>
     </div>
   );
 }
@@ -6168,7 +6411,7 @@ function Reports({ user }) {
         }
 
         const authorizedUsers = (managers || []).filter(m =>
-          m.role === 'admin' || m.role === 'gerente' || m.role === 'goodadmin'
+          m.role === 'admin' || m.role === 'gerente'
         );
 
         setAvailableManagers(authorizedUsers);
@@ -6231,7 +6474,7 @@ function Reports({ user }) {
     let actingUser = user;
 
     // Se o usuário logado já é gerente/admin, verificar sua própria senha
-    if (user.role === 'admin' || user.role === 'gerente' || user.role === 'goodadmin') {
+    if (user.role === 'admin' || user.role === 'gerente') {
       console.log('[confirmCancel] Usuário é gerente/admin, verificando própria senha');
       passwordValid = await verifyUserPasswordPOS(cancelPassword);
       console.log('[confirmCancel] Resultado validação própria senha:', passwordValid);
@@ -6262,9 +6505,9 @@ function Reports({ user }) {
         
         console.log('[confirmCancel] Usuários encontrados:', managers?.length || 0);
         
-        // Filtrar apenas admin/gerente/goodadmin
+        // Filtrar apenas admin/gerente
         const authorizedUsers = managers?.filter(m => 
-          m.role === 'admin' || m.role === 'gerente' || m.role === 'goodadmin'
+          m.role === 'admin' || m.role === 'gerente'
         ) || [];
         
         console.log('[confirmCancel] Gerentes/admins encontrados:', authorizedUsers.length);
@@ -6985,7 +7228,7 @@ function Reports({ user }) {
             setAvailableClosureManagers([]);
           } else {
             const authorizedUsers = (managers || []).filter(m =>
-              m.role === 'admin' || m.role === 'gerente' || m.role === 'goodadmin'
+              m.role === 'admin' || m.role === 'gerente'
             );
             setAvailableClosureManagers(authorizedUsers);
           }
@@ -7013,7 +7256,7 @@ function Reports({ user }) {
     let authorizedUser = null;
     
     // Se o usuário logado já é gerente/admin, verificar sua própria senha
-    if (user.role === 'admin' || user.role === 'gerente' || user.role === 'goodadmin') {
+    if (user.role === 'admin' || user.role === 'gerente') {
       if (user?.email && user?.id) {
         try {
           // Verificar senha usando Supabase Auth
@@ -7079,7 +7322,7 @@ function Reports({ user }) {
     }
 
     if (!passwordValid) {
-      setClosureError("Apenas gerente, admin ou goodadmin podem fechar o caixa.");
+      setClosureError("Apenas gerente ou admin podem fechar o caixa.");
       return;
     }
 
@@ -8252,32 +8495,7 @@ function Online({ user }) {
 
   const refreshOrders = () => {
     const existing = db.onlineOrders.list() || [];
-    if (!existing || existing.length === 0) {
-      const demoOrder = {
-        id: 'DEMO-ORDER-001',
-        isDemo: true,
-        status: 'aguardo',
-        customerName: 'Maria Exemplo',
-        orderNumber: '1001',
-        createdAt: new Date().toISOString(),
-        productName: 'Camiseta Básica Preto',
-        productCode: 'SKU-DEMO-001',
-        quantity: 1,
-        totalAmount: 89.9,
-        paymentMethod: 'Cartão (Visa) - Aprovado',
-        shippingAddress: {
-          street: 'Rua das Flores',
-          number: '123',
-          neighborhood: 'Centro',
-          city: 'São Paulo',
-          state: 'SP',
-          zipCode: '01000-000'
-        }
-      };
-      setOrders([demoOrder]);
-    } else {
-      setOrders(existing);
-    }
+    setOrders(existing);
   };
 
   const updateOrderStatus = (orderId, newStatus) => {
@@ -8693,7 +8911,7 @@ export default function App() {
       }
       // Garantir tenantId
       if (!user.tenantId) {
-        if ((user.role === 'admin' || user.role === 'goodadmin') && user.email) {
+        if (user.role === 'admin' && user.email) {
           user.tenantId = user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
         } else {
           const allUsers = db.users.list();
@@ -8707,18 +8925,10 @@ export default function App() {
       setCurrentUser(user);
       setError(null);
       
-      // Redirecionar GoodAdmin para /goodadmin, demais usuários para /pos
-      const isGoodAdmin = user?.email === 'goodadm@studiovigo.com' || 
-                         user?.role === 'goodadmin';
-      if (isGoodAdmin) {
-        setTimeout(() => {
-          window.location.hash = '#/goodadmin';
-        }, 100);
-      } else {
-        setTimeout(() => {
-          window.location.hash = '#/pos';
-        }, 100);
-      }
+      // Redirecionar todos para /pos
+      setTimeout(() => {
+        window.location.hash = '#/pos';
+      }, 100);
     }
   };
 
@@ -8740,21 +8950,21 @@ export default function App() {
     return children;
   };
 
-  // Componente para rota protegida do GoodAdmin
+  // Componente para rota protegida do Admin
   const ProtectedGoodAdminRoute = ({ children }) => {
     if (!currentUser || !currentUser.role) {
       return <Login onLogin={handleLogin} />;
     }
     
-    // Verificar se é GoodAdmin
+    // Verificar se é Admin
     const isGoodAdmin = currentUser?.email === 'goodadm@studiovigo.com' || 
-                       currentUser?.role === 'goodadmin';
+                       currentUser?.role === 'admin';
     
     if (!isGoodAdmin) {
       return (
         <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4">
           <Card className="p-8 text-center rounded-xl max-w-md">
-            <p className="text-red-500 font-bold mb-4">Acesso negado. Apenas GoodAdmin pode acessar esta página.</p>
+            <p className="text-red-500 font-bold mb-4">Acesso negado. Apenas Admin pode acessar esta página.</p>
             <Button onClick={() => setCurrentUser(null)} className="rounded-full">Fazer Login Novamente</Button>
           </Card>
         </div>
@@ -8799,7 +9009,7 @@ export default function App() {
           <Route 
             path="/settings" 
             element={
-              <ProtectedRoute requireRole={['gerente', 'admin', 'goodadmin']}>
+              <ProtectedRoute requireRole={['gerente', 'admin']}>
                 {currentUser && currentUser.role ? (
                   <Layout user={currentUser} onLogout={() => {
                     setCurrentUser(null);
@@ -8857,16 +9067,6 @@ export default function App() {
                   </Layout>
                 ) : null}
               </ProtectedRoute>
-            } 
-          />
-
-          {/* Rota GoodAdmin */}
-          <Route 
-            path="/goodadmin" 
-            element={
-              <ProtectedGoodAdminRoute>
-                <GoodAdmin user={currentUser} />
-              </ProtectedGoodAdminRoute>
             } 
           />
 
