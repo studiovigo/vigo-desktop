@@ -32,6 +32,7 @@
     "@tauri-apps/plugin-shell": "^2.0.3",
     "better-sqlite3": "^9.6.0",
     "date-fns": "^2.30.0",
+    "dotenv": "^17.2.3",
     "express": "^4.19.2",
     "html5-qrcode": "^2.3.8",
     "lucide-react": "^0.469.0",

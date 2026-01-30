@@ -400,7 +400,30 @@ function Login({ onLogin }) {
         }
         
         console.log('[Login CPF] Login bem-sucedido via Supabase Auth');
-        return result.user;
+        // Mesclar dados de autenticação com dados do usuário (metadata customizada)
+        const authUser = result.user;
+        const mergedUser = {
+          ...authUser,
+          // Preservar campos customizados do userData (store_id, tenant_id, role, etc.)
+          id: userData.id || authUser.id,
+          email: userData.email || authUser.email,
+          name: userData.name || null,
+          role: userData.role || 'caixa',
+          store_id: userData.store_id || userData.tenant_id || null, // IMPORTANTE: preservar store_id
+          tenant_id: userData.tenant_id || userData.store_id || null,
+          tenantId: userData.tenant_id || userData.store_id || null,
+          cpf: userData.cpf || null,
+          active: userData.active !== undefined ? userData.active : true,
+        };
+        console.log('[Login CPF] Usuário mesclado:', {
+          id: mergedUser.id,
+          email: mergedUser.email,
+          name: mergedUser.name,
+          role: mergedUser.role,
+          store_id: mergedUser.store_id,
+          tenantId: mergedUser.tenantId
+        });
+        return mergedUser;
       } else {
         console.log('[Login CPF] Usuário sem email, verificando senha diretamente');
         // Usuário sem email, verificar senha diretamente
@@ -526,22 +549,44 @@ function Login({ onLogin }) {
         if (!user.role) {
           user.role = 'caixa'; // Default
         }
-        // Calcular e atribuir tenantId
+        
+        // IMPORTANTE: Garantir que o usuário tem store_id
+        // Prioridade: store_id > tenantId > calculado do email
+        if (!user.store_id && user.tenantId) {
+          user.store_id = user.tenantId;
+        }
+        
+        // Calcular e atribuir tenantId se não existir
         if (user.role === 'admin' && user.email) {
           // ADMIN usa email como tenantId
-          user.tenantId = user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
+          const calculatedTenantId = user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
+          user.tenantId = user.tenantId || calculatedTenantId;
+          user.store_id = user.store_id || calculatedTenantId; // IMPORTANTE: também atribuir ao store_id
         } else if (!user.tenantId) {
           // GERENTE/CAIXA herda tenantId do admin que os criou
           // Se não tiver, busca o tenantId do admin no sistema
           const data = db.users.list();
           const admin = data.find(u => u.role === 'admin');
           if (admin && admin.email) {
-            user.tenantId = admin.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
+            const adminTenantId = admin.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
+            user.tenantId = adminTenantId;
+            user.store_id = user.store_id || adminTenantId; // IMPORTANTE: também atribuir ao store_id
           } else {
             user.tenantId = 'default';
+            user.store_id = user.store_id || 'default'; // IMPORTANTE: também atribuir ao store_id
           }
         }
-        // Salvar usuário no localStorage para acesso ao tenantId
+        
+        console.log('[Login] Usuário preparado para salvar:', {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          role: user.role,
+          store_id: user.store_id,
+          tenantId: user.tenantId
+        });
+        
+        // Salvar usuário no localStorage para acesso ao tenantId E store_id
         localStorage.setItem('mozyc_pdv_current_user', JSON.stringify(user));
         
         // Salvar credenciais se "Lembrar-me" estiver marcado
@@ -816,6 +861,7 @@ function Layout({ children, user, onLogout }) {
       { url: "/products", icon: Package, title: "Produtos", roles: ["caixa", "gerente", "admin"] },
       { url: "/reports", icon: FileText, title: "Relatórios", roles: ["caixa", "gerente", "admin"] },
       { url: "/online", icon: Globe, title: "Online", roles: ["caixa", "gerente", "admin"] },
+      { url: "/config", icon: Settings, title: "Configurações", roles: ["gerente", "admin"] },
     ];
     
     // Filtrar menu baseado no role do usuário
@@ -1489,15 +1535,16 @@ function SettingsPage({ user }) {
                 </div>
               )}
               
-              {/* Listar outros usuários (excluindo o usuário logado e usuários padrão) */}
+              {/* Listar outros usuários (excluindo o usuário logado e Adriano Admin) */}
               {users
                 .filter(u => 
                   u.active !== false && 
                   u.id !== user?.id && 
                   (u.email !== user?.email || !user?.email) &&
                   // Remover usuário padrão "Adriano Admin"
+                  u.id !== 'admin' &&
                   u.email !== 'admin@lbbrand.com' &&
-                  u.name !== 'Luana Admin'
+                  u.name !== 'Adriano Admin'
                 )
                 .map(u => (
                 <div key={u.id} className="flex justify-between items-center border-b p-2 rounded-lg">
@@ -1962,7 +2009,7 @@ function POS({ user }) {
   };
 
 
-  const checkCoupon = async () => {
+  const checkCoupon = useCallback(async () => {
     // Buscar cupons do SBD primeiro, fallback para localStorage
     let coupons = [];
     try {
@@ -1983,7 +2030,7 @@ function POS({ user }) {
       alert("Cupom inválido");
       setAppliedDiscount(0);
     }
-  };
+  }, [discountCode]);
 
 
   const subtotal = cart.reduce((a, b) => a + (b.price * b.qtd), 0);
@@ -1996,7 +2043,7 @@ function POS({ user }) {
     : 0;
 
 
-  const finish = () => {
+  const finish = useCallback(() => {
     console.log('[finish] 🚀 Iniciando processo de finalização...');
     console.log('[finish] Método de pagamento:', payMethod);
     console.log('[finish] Total final:', totalFinal);
@@ -2109,7 +2156,7 @@ function POS({ user }) {
     setShowNFCeModal(true);
     
     console.log('[finish] 🎉 Finalizou! Modal NFC-e deve estar visível agora.');
-  };
+  }, [payMethod, pixType, moneyReceived, totalFinal, discountAmount, cart, products]);
   
   // Iniciar worker da fila unificada (SQLite/localStorage)
 
@@ -2588,7 +2635,7 @@ function POS({ user }) {
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
     };
-  }, [showPayModal, cart.length, payMethod, pixType, checkCoupon, finish]);
+  }, [showPayModal, showNFCeModal, cart.length, payMethod, pixType, checkCoupon, finish]);
 
 
   return (
@@ -3708,7 +3755,7 @@ function Products({ user }) {
   };
 
   const handleDeleteModel = async (model) => {
-    if (!confirm(`Excluir modelo '${model.name}'? Esta ação também removerá produtos relacionados.`)) return;
+    if (!confirm(`Você tem certeza que quer escluir esse modelo?\n\nModelo: ${model.name}\n\nEsta ação também removerá todos os produtos relacionados.`)) return;
     
     // Verificar se user está definido
     if (!user) {
@@ -4849,6 +4896,30 @@ function Dashboard({ user }) {
   const [closures, setClosures] = useState([]);
   const [selectedClosure, setSelectedClosure] = useState(null);
   const [showClosureViewModal, setShowClosureViewModal] = useState(false);
+  const [fiscalConfig, setFiscalConfig] = useState({
+    razaoSocial: "",
+    nomeFantasia: "",
+    cnpj: "",
+    inscricaoEstadual: "",
+    inscricaoMunicipal: "",
+    cep: "",
+    endereco: "",
+    numero: "",
+    complemento: "",
+    bairro: "",
+    cidade: "",
+    estado: "",
+    telefone: "",
+    email: "",
+    regimeTributario: "1", // 1-Simples Nacional, 2-Simples Nacional excesso, 3-Normal
+    cnae: "",
+    // Campos específicos para nota fiscal
+    serie: "1",
+    numeroNota: "1",
+    // Para pré-venda, não precisamos da chave API Sefaz
+    // certificadoDigital: "",
+    // senhaCertificado: ""
+  });
 
   // Verificar se há parâmetro de tab na URL
   useEffect(() => {
@@ -4862,6 +4933,16 @@ function Dashboard({ user }) {
   useEffect(() => {
     try {
       refreshData();
+      // Carregar configurações fiscais do localStorage
+      const savedConfig = localStorage.getItem('fiscalConfig');
+      if (savedConfig) {
+        try {
+          const parsed = JSON.parse(savedConfig);
+          setFiscalConfig(parsed);
+        } catch (e) {
+          console.error('[Dashboard] Erro ao carregar configurações fiscais:', e);
+        }
+      }
     } catch (error) {
       console.error("Erro ao carregar dados:", error);
       setExpenses([]);
@@ -5719,6 +5800,13 @@ function Dashboard({ user }) {
         >
           <FileText size={18} className="mr-2"/> Fechamentos ({closures.length})
         </Button>
+        <Button 
+          variant={tab === "config" ? "primary" : "outline"} 
+          onClick={() => setTab("config")} 
+          className="rounded-full"
+        >
+          <Settings size={18} className="mr-2"/> Configurações
+        </Button>
       </div>
 
       {tab === "overview" && (
@@ -6239,6 +6327,348 @@ function Dashboard({ user }) {
           </Card>
         </div>
       )}
+
+      {tab === "config" && (
+        <div className="space-y-6">
+          <div className="flex justify-between items-center">
+            <h2 className="text-2xl font-bold">Configurações Fiscais</h2>
+            <Button
+              variant="primary"
+              className="rounded-full"
+              onClick={async () => {
+                try {
+                  // Salvar configurações no localStorage
+                  localStorage.setItem('fiscalConfig', JSON.stringify(fiscalConfig));
+                  
+                  // Tentar salvar no Supabase também
+                  try {
+                    const { supabaseDB } = await import('./services/supabaseDB.js');
+                    // Aqui você pode criar uma função específica para salvar configs
+                    // Por enquanto, vamos usar localStorage
+                  } catch (error) {
+                    console.log('[Config] Salvando apenas localmente');
+                  }
+                  
+                  alert("Configurações salvas com sucesso!");
+                } catch (error) {
+                  console.error('[Config] Erro ao salvar configurações:', error);
+                  alert("Erro ao salvar configurações!");
+                }
+              }}
+            >
+              <Settings size={18} className="mr-2"/> Salvar Configurações
+            </Button>
+          </div>
+
+          <Card className="p-6 rounded-xl">
+            <h3 className="font-bold text-lg mb-4">Informações da Empresa</h3>
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Razão Social <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  type="text"
+                  placeholder="Nome empresarial completo"
+                  value={fiscalConfig.razaoSocial}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, razaoSocial: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Nome Fantasia
+                </label>
+                <Input
+                  type="text"
+                  placeholder="Nome comercial"
+                  value={fiscalConfig.nomeFantasia}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, nomeFantasia: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  CNPJ <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  type="text"
+                  placeholder="00.000.000/0000-00"
+                  value={fiscalConfig.cnpj}
+                  onChange={(e) => {
+                    const value = e.target.value.replace(/\D/g, '');
+                    let formatted = value;
+                    if (value.length <= 14) {
+                      formatted = value.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})/, '$1.$2.$3/$4-$5');
+                    }
+                    setFiscalConfig({...fiscalConfig, cnpj: formatted});
+                  }}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Inscrição Estadual
+                </label>
+                <Input
+                  type="text"
+                  placeholder="000.000.000.000"
+                  value={fiscalConfig.inscricaoEstadual}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, inscricaoEstadual: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Inscrição Municipal
+                </label>
+                <Input
+                  type="text"
+                  placeholder="000000000"
+                  value={fiscalConfig.inscricaoMunicipal}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, inscricaoMunicipal: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  CNAE
+                </label>
+                <Input
+                  type="text"
+                  placeholder="0000-0/00"
+                  value={fiscalConfig.cnae}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, cnae: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Regime Tributário <span className="text-red-500">*</span>
+                </label>
+                <select
+                  value={fiscalConfig.regimeTributario}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, regimeTributario: e.target.value})}
+                  className="w-full border rounded px-2 py-1"
+                >
+                  <option value="1">Simples Nacional</option>
+                  <option value="2">Simples Nacional - Excesso</option>
+                  <option value="3">Regime Normal</option>
+                </select>
+              </div>
+            </div>
+          </Card>
+
+          <Card className="p-6 rounded-xl">
+            <h3 className="font-bold text-lg mb-4">Endereço</h3>
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  CEP <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  type="text"
+                  placeholder="00000-000"
+                  value={fiscalConfig.cep}
+                  onChange={(e) => {
+                    const value = e.target.value.replace(/\D/g, '');
+                    const formatted = value.replace(/^(\d{5})(\d{3})/, '$1-$2');
+                    setFiscalConfig({...fiscalConfig, cep: formatted});
+                  }}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Endereço <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  type="text"
+                  placeholder="Rua, Avenida, etc"
+                  value={fiscalConfig.endereco}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, endereco: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Número <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  type="text"
+                  placeholder="000"
+                  value={fiscalConfig.numero}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, numero: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Complemento
+                </label>
+                <Input
+                  type="text"
+                  placeholder="Sala, Bloco, etc"
+                  value={fiscalConfig.complemento}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, complemento: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Bairro <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  type="text"
+                  placeholder="Centro"
+                  value={fiscalConfig.bairro}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, bairro: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Cidade <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  type="text"
+                  placeholder="Nome da cidade"
+                  value={fiscalConfig.cidade}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, cidade: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Estado <span className="text-red-500">*</span>
+                </label>
+                <select
+                  value={fiscalConfig.estado}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, estado: e.target.value})}
+                  className="w-full border rounded px-2 py-1"
+                >
+                  <option value="">Selecione...</option>
+                  <option value="AC">AC</option>
+                  <option value="AL">AL</option>
+                  <option value="AP">AP</option>
+                  <option value="AM">AM</option>
+                  <option value="BA">BA</option>
+                  <option value="CE">CE</option>
+                  <option value="DF">DF</option>
+                  <option value="ES">ES</option>
+                  <option value="GO">GO</option>
+                  <option value="MA">MA</option>
+                  <option value="MT">MT</option>
+                  <option value="MS">MS</option>
+                  <option value="MG">MG</option>
+                  <option value="PA">PA</option>
+                  <option value="PB">PB</option>
+                  <option value="PR">PR</option>
+                  <option value="PE">PE</option>
+                  <option value="PI">PI</option>
+                  <option value="RJ">RJ</option>
+                  <option value="RN">RN</option>
+                  <option value="RS">RS</option>
+                  <option value="RO">RO</option>
+                  <option value="RR">RR</option>
+                  <option value="SC">SC</option>
+                  <option value="SP">SP</option>
+                  <option value="SE">SE</option>
+                  <option value="TO">TO</option>
+                </select>
+              </div>
+            </div>
+          </Card>
+
+          <Card className="p-6 rounded-xl">
+            <h3 className="font-bold text-lg mb-4">Contato</h3>
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Telefone <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  type="text"
+                  placeholder="(00) 00000-0000"
+                  value={fiscalConfig.telefone}
+                  onChange={(e) => {
+                    const value = e.target.value.replace(/\D/g, '');
+                    let formatted = value;
+                    if (value.length <= 11) {
+                      formatted = value.replace(/^(\d{2})(\d{5})(\d{4})/, '($1) $2-$3');
+                    }
+                    setFiscalConfig({...fiscalConfig, telefone: formatted});
+                  }}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Email <span className="text-red-500">*</span>
+                </label>
+                <Input
+                  type="email"
+                  placeholder="contato@empresa.com"
+                  value={fiscalConfig.email}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, email: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+            </div>
+          </Card>
+
+          <Card className="p-6 rounded-xl">
+            <h3 className="font-bold text-lg mb-4">Configurações de Nota Fiscal</h3>
+            <div className="grid md:grid-cols-2 gap-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Série da Nota
+                </label>
+                <Input
+                  type="text"
+                  placeholder="1"
+                  value={fiscalConfig.serie}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, serie: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Número Inicial da Nota
+                </label>
+                <Input
+                  type="text"
+                  placeholder="1"
+                  value={fiscalConfig.numeroNota}
+                  onChange={(e) => setFiscalConfig({...fiscalConfig, numeroNota: e.target.value})}
+                  className="w-full"
+                />
+              </div>
+            </div>
+
+            <div className="mt-4 p-4 bg-blue-50 rounded-lg border border-blue-200">
+              <p className="text-sm text-blue-800">
+                <strong>Nota:</strong> Para emissão de nota fiscal eletrônica (NF-e), será necessário configurar o certificado digital e as credenciais da SEFAZ em uma versão futura. 
+                Por enquanto, estas configurações são utilizadas para pré-vendas e documentos auxiliares.
+              </p>
+            </div>
+          </Card>
+        </div>
+      )}
     </div>
   );
 }
@@ -6550,7 +6980,7 @@ function Reports({ user }) {
       }
     }
 
-    const result = db.sales.cancel(selectedSale.id, cancelPassword, actingUser);
+    const result = await db.sales.cancel(selectedSale.id, cancelPassword, actingUser);
     
     if (result.success) {
       // Atualizar também o localStorage para refletir o cancelamento nesta sessão
@@ -6836,14 +7266,7 @@ function Reports({ user }) {
       });
     });
 
-    // Descontar cancelamentos
-    dayCancelled.forEach(sale => {
-      totalSales -= sale.total_amount;
-      const method = sale.payment_method || 'money';
-      if (paymentMethods[method]) {
-        paymentMethods[method] -= sale.total_amount;
-      }
-    });
+    // Canceladas não entram no total de vendas (já filtradas em daySales)
 
     // Calcular despesas do dia
     const dayExpenses = db.expenses.list().filter(expense => {
@@ -7166,13 +7589,7 @@ function Reports({ user }) {
       });
     });
 
-    cancelledOfCurrentCash.forEach(sale => {
-      totalSales -= sale.total_amount;
-      const method = sale.payment_method || 'money';
-      if (paymentMethods[method]) {
-        paymentMethods[method] -= sale.total_amount;
-      }
-    });
+    // Canceladas não entram no total de vendas (já filtradas em salesOfCurrentCash)
 
     const today = new Date();
     const dayExpenses = db.expenses.list().filter(expense => {
@@ -8696,6 +9113,386 @@ function Online({ user }) {
   );
 }
 
+// Componente de Configurações Fiscais
+function ConfigPage({ user }) {
+  const [fiscalConfig, setFiscalConfig] = useState({
+    razaoSocial: "",
+    nomeFantasia: "",
+    cnpj: "",
+    inscricaoEstadual: "",
+    inscricaoMunicipal: "",
+    cep: "",
+    endereco: "",
+    numero: "",
+    complemento: "",
+    bairro: "",
+    cidade: "",
+    estado: "",
+    telefone: "",
+    email: "",
+    regimeTributario: "1",
+    cnae: "",
+    serie: "1",
+    numeroNota: "1",
+  });
+
+  useEffect(() => {
+    // Carregar configurações salvas
+    const savedConfig = localStorage.getItem('fiscalConfig');
+    if (savedConfig) {
+      try {
+        const parsed = JSON.parse(savedConfig);
+        setFiscalConfig(parsed);
+      } catch (e) {
+        console.error('[ConfigPage] Erro ao carregar configurações:', e);
+      }
+    }
+  }, []);
+
+  const handleSave = async () => {
+    try {
+      // Salvar no localStorage
+      localStorage.setItem('fiscalConfig', JSON.stringify(fiscalConfig));
+      
+      // Tentar salvar no Supabase também
+      try {
+        const { supabaseDB } = await import('./services/supabaseDB.js');
+        // Aqui você pode criar uma função específica para salvar configs
+      } catch (error) {
+        console.log('[ConfigPage] Salvando apenas localmente');
+      }
+      
+      alert("Configurações salvas com sucesso!");
+    } catch (error) {
+      console.error('[ConfigPage] Erro ao salvar configurações:', error);
+      alert("Erro ao salvar configurações!");
+    }
+  };
+
+  return (
+    <div className="space-y-6 p-6">
+      <div className="flex justify-between items-center">
+        <h2 className="text-2xl font-bold">Configurações Fiscais</h2>
+        <Button
+          variant="primary"
+          className="rounded-full"
+          onClick={handleSave}
+        >
+          <Settings size={18} className="mr-2"/> Salvar Configurações
+        </Button>
+      </div>
+
+      <Card className="p-6 rounded-xl">
+        <h3 className="font-bold text-lg mb-4">Informações da Empresa</h3>
+        <div className="grid md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Razão Social <span className="text-red-500">*</span>
+            </label>
+            <Input
+              type="text"
+              placeholder="Nome empresarial completo"
+              value={fiscalConfig.razaoSocial}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, razaoSocial: e.target.value})}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Nome Fantasia
+            </label>
+            <Input
+              type="text"
+              placeholder="Nome comercial"
+              value={fiscalConfig.nomeFantasia}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, nomeFantasia: e.target.value})}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              CNPJ <span className="text-red-500">*</span>
+            </label>
+            <Input
+              type="text"
+              placeholder="00.000.000/0000-00"
+              value={fiscalConfig.cnpj}
+              onChange={(e) => {
+                const value = e.target.value.replace(/\D/g, '');
+                let formatted = value;
+                if (value.length <= 14) {
+                  formatted = value.replace(/^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})/, '$1.$2.$3/$4-$5');
+                }
+                setFiscalConfig({...fiscalConfig, cnpj: formatted});
+              }}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Inscrição Estadual
+            </label>
+            <Input
+              type="text"
+              placeholder="000.000.000.000"
+              value={fiscalConfig.inscricaoEstadual}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, inscricaoEstadual: e.target.value})}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Inscrição Municipal
+            </label>
+            <Input
+              type="text"
+              placeholder="000000000"
+              value={fiscalConfig.inscricaoMunicipal}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, inscricaoMunicipal: e.target.value})}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              CNAE
+            </label>
+            <Input
+              type="text"
+              placeholder="0000-0/00"
+              value={fiscalConfig.cnae}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, cnae: e.target.value})}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Regime Tributário <span className="text-red-500">*</span>
+            </label>
+            <select
+              value={fiscalConfig.regimeTributario}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, regimeTributario: e.target.value})}
+              className="w-full border rounded px-2 py-1"
+            >
+              <option value="1">Simples Nacional</option>
+              <option value="2">Simples Nacional - Excesso</option>
+              <option value="3">Regime Normal</option>
+            </select>
+          </div>
+        </div>
+      </Card>
+
+      <Card className="p-6 rounded-xl">
+        <h3 className="font-bold text-lg mb-4">Endereço</h3>
+        <div className="grid md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              CEP <span className="text-red-500">*</span>
+            </label>
+            <Input
+              type="text"
+              placeholder="00000-000"
+              value={fiscalConfig.cep}
+              onChange={(e) => {
+                const value = e.target.value.replace(/\D/g, '');
+                const formatted = value.replace(/^(\d{5})(\d{3})/, '$1-$2');
+                setFiscalConfig({...fiscalConfig, cep: formatted});
+              }}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Endereço <span className="text-red-500">*</span>
+            </label>
+            <Input
+              type="text"
+              placeholder="Rua, Avenida, etc"
+              value={fiscalConfig.endereco}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, endereco: e.target.value})}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Número <span className="text-red-500">*</span>
+            </label>
+            <Input
+              type="text"
+              placeholder="000"
+              value={fiscalConfig.numero}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, numero: e.target.value})}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Complemento
+            </label>
+            <Input
+              type="text"
+              placeholder="Sala, Bloco, etc"
+              value={fiscalConfig.complemento}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, complemento: e.target.value})}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Bairro <span className="text-red-500">*</span>
+            </label>
+            <Input
+              type="text"
+              placeholder="Centro"
+              value={fiscalConfig.bairro}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, bairro: e.target.value})}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Cidade <span className="text-red-500">*</span>
+            </label>
+            <Input
+              type="text"
+              placeholder="Nome da cidade"
+              value={fiscalConfig.cidade}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, cidade: e.target.value})}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Estado <span className="text-red-500">*</span>
+            </label>
+            <select
+              value={fiscalConfig.estado}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, estado: e.target.value})}
+              className="w-full border rounded px-2 py-1"
+            >
+              <option value="">Selecione...</option>
+              <option value="AC">AC</option>
+              <option value="AL">AL</option>
+              <option value="AP">AP</option>
+              <option value="AM">AM</option>
+              <option value="BA">BA</option>
+              <option value="CE">CE</option>
+              <option value="DF">DF</option>
+              <option value="ES">ES</option>
+              <option value="GO">GO</option>
+              <option value="MA">MA</option>
+              <option value="MT">MT</option>
+              <option value="MS">MS</option>
+              <option value="MG">MG</option>
+              <option value="PA">PA</option>
+              <option value="PB">PB</option>
+              <option value="PR">PR</option>
+              <option value="PE">PE</option>
+              <option value="PI">PI</option>
+              <option value="RJ">RJ</option>
+              <option value="RN">RN</option>
+              <option value="RS">RS</option>
+              <option value="RO">RO</option>
+              <option value="RR">RR</option>
+              <option value="SC">SC</option>
+              <option value="SP">SP</option>
+              <option value="SE">SE</option>
+              <option value="TO">TO</option>
+            </select>
+          </div>
+        </div>
+      </Card>
+
+      <Card className="p-6 rounded-xl">
+        <h3 className="font-bold text-lg mb-4">Contato</h3>
+        <div className="grid md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Telefone <span className="text-red-500">*</span>
+            </label>
+            <Input
+              type="text"
+              placeholder="(00) 00000-0000"
+              value={fiscalConfig.telefone}
+              onChange={(e) => {
+                const value = e.target.value.replace(/\D/g, '');
+                let formatted = value;
+                if (value.length <= 11) {
+                  formatted = value.replace(/^(\d{2})(\d{5})(\d{4})/, '($1) $2-$3');
+                }
+                setFiscalConfig({...fiscalConfig, telefone: formatted});
+              }}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Email <span className="text-red-500">*</span>
+            </label>
+            <Input
+              type="email"
+              placeholder="contato@empresa.com"
+              value={fiscalConfig.email}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, email: e.target.value})}
+              className="w-full"
+            />
+          </div>
+        </div>
+      </Card>
+
+      <Card className="p-6 rounded-xl">
+        <h3 className="font-bold text-lg mb-4">Configurações de Nota Fiscal</h3>
+        <div className="grid md:grid-cols-2 gap-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Série da Nota
+            </label>
+            <Input
+              type="text"
+              placeholder="1"
+              value={fiscalConfig.serie}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, serie: e.target.value})}
+              className="w-full"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">
+              Número Inicial da Nota
+            </label>
+            <Input
+              type="text"
+              placeholder="1"
+              value={fiscalConfig.numeroNota}
+              onChange={(e) => setFiscalConfig({...fiscalConfig, numeroNota: e.target.value})}
+              className="w-full"
+            />
+          </div>
+        </div>
+
+        <div className="mt-4 p-4 bg-blue-50 rounded-lg border border-blue-200">
+          <p className="text-sm text-blue-800">
+            <strong>Nota:</strong> Para emissão de nota fiscal eletrônica (NF-e), será necessário configurar o certificado digital e as credenciais da SEFAZ em uma versão futura. 
+            Por enquanto, estas configurações são utilizadas para pré-vendas e documentos auxiliares.
+          </p>
+        </div>
+      </Card>
+    </div>
+  );
+}
+
 // 5. App Principal (Rotas e Controle de Sessão)
 // Componente de Teste do Supabase (temporário)
 function TestSupabase() {
@@ -9064,6 +9861,22 @@ export default function App() {
                     setError(null);
                   }}>
                     <Online user={currentUser} />
+                  </Layout>
+                ) : null}
+              </ProtectedRoute>
+            } 
+          />
+
+          <Route 
+            path="/config" 
+            element={
+              <ProtectedRoute>
+                {currentUser && currentUser.role ? (
+                  <Layout user={currentUser} onLogout={() => {
+                    setCurrentUser(null);
+                    setError(null);
+                  }}>
+                    <ConfigPage user={currentUser} />
                   </Layout>
                 ) : null}
               </ProtectedRoute>

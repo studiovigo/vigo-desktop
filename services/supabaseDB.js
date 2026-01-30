@@ -27,13 +27,41 @@ const getCurrentUserId = async () => {
   }
 };
 
+// Helper para recuperar store_id real quando está como 'default_store'
+const getActualStoreId = async () => {
+  let storeId = getCurrentStoreId();
+  
+  // Se storeId é default_store, tentar recuperar o real
+  if (storeId === 'default_store') {
+    console.log('[supabaseDB] Tentando recuperar store_id real...');
+    const { data: allProducts, error } = await supabase
+      .from('products')
+      .select('store_id')
+      .limit(1);
+    
+    if (!error && allProducts && allProducts.length > 0) {
+      storeId = allProducts[0].store_id;
+      console.log('[supabaseDB] Store_id recuperado:', storeId);
+    }
+  }
+  
+  return storeId;
+};
+
 export const supabaseDB = {
   // ============================================
   // PRODUTOS
   // ============================================
   products: {
     list: async () => {
-      const storeId = getCurrentStoreId();
+      let storeId = getCurrentStoreId();
+      console.log('[supabaseDB.products.list] Buscando produtos com store_id:', storeId);
+      
+      // Se storeId é default_store, recuperar o real
+      if (storeId === 'default_store') {
+        storeId = await getActualStoreId();
+      }
+      
       const { data, error } = await supabase
         .from('products')
         .select('*')
@@ -41,14 +69,37 @@ export const supabaseDB = {
         .order('name', { ascending: true });
       
       if (error) {
-        console.error('Erro ao listar produtos:', error);
+        console.error('[supabaseDB.products.list] Erro ao listar produtos:', error);
         return [];
       }
+      
+      // Debug: Se não encontrou produtos e não é default_store, tentar listar TODOS para ver quais existem
+      if ((!data || data.length === 0) && storeId !== 'default_store') {
+        console.warn('[supabaseDB.products.list] Nenhum produto encontrado para store_id:', storeId);
+        console.warn('[supabaseDB.products.list] Listando TODOS os produtos para debug...');
+        const { data: allProducts, error: allError } = await supabase
+          .from('products')
+          .select('id, name, store_id')
+          .limit(20);
+        
+        if (!allError && allProducts) {
+          console.warn('[supabaseDB.products.list] Produtos existentes no Supabase (primeiros 20):', 
+            allProducts.map(p => ({ id: p.id, name: p.name, store_id: p.store_id }))
+          );
+        }
+      }
+      
       return data || [];
     },
 
     findByCode: async (code) => {
-      const storeId = getCurrentStoreId();
+      let storeId = getCurrentStoreId();
+      
+      // Se storeId é default_store, recuperar o real
+      if (storeId === 'default_store') {
+        storeId = await getActualStoreId();
+      }
+      
       const { data, error } = await supabase
         .from('products')
         .select('*')
@@ -57,7 +108,29 @@ export const supabaseDB = {
         .maybeSingle();
       
       if (error) {
-        console.error('Erro ao buscar produto:', error);
+        console.error('[supabaseDB.products.findByCode] Erro ao buscar produto:', error);
+        return null;
+      }
+      return data;
+    },
+
+    findById: async (id) => {
+      let storeId = getCurrentStoreId();
+      
+      // Se storeId é default_store, recuperar o real
+      if (storeId === 'default_store') {
+        storeId = await getActualStoreId();
+      }
+      
+      const { data, error } = await supabase
+        .from('products')
+        .select('*')
+        .eq('store_id', storeId)
+        .eq('id', id)
+        .maybeSingle();
+
+      if (error) {
+        console.error('Erro ao buscar produto por ID:', error);
         return null;
       }
       return data;
@@ -124,7 +197,12 @@ export const supabaseDB = {
     },
 
     update: async (id, updates, user) => {
-      const storeId = getCurrentStoreId();
+      let storeId = getCurrentStoreId();
+      
+      // Se storeId é default_store, recuperar o real
+      if (storeId === 'default_store') {
+        storeId = await getActualStoreId();
+      }
       
       // Garantir que store_id está sempre presente nos updates
       const updatesWithStoreId = {
@@ -214,7 +292,14 @@ export const supabaseDB = {
     },
 
     delete: async (id, user) => {
-      const storeId = getCurrentStoreId();
+      let storeId = getCurrentStoreId();
+      
+      // Se storeId é default_store, recuperar o real
+      if (storeId === 'default_store') {
+        storeId = await getActualStoreId();
+      }
+      
+      console.log('[supabaseDB.products.delete] Deletando produto com id:', id, 'store_id:', storeId);
       
       const { error } = await supabase
         .from('products')
@@ -223,17 +308,23 @@ export const supabaseDB = {
         .eq('store_id', storeId);
       
       if (error) {
-        console.error('Erro ao deletar produto:', error);
+        console.error('[supabaseDB.products.delete] Erro ao deletar produto:', error);
         throw error;
       }
       
+      console.log('[supabaseDB.products.delete] Produto deletado com sucesso:', id);
       return { success: true };
     },
 
     // Buscar produtos por model_name (para exclusão de modelos)
     // Tenta buscar por model_name se a coluna existir, caso contrário busca por nome que começa com o modelo
     listByModelName: async (modelName) => {
-      const storeId = getCurrentStoreId();
+      let storeId = getCurrentStoreId();
+      
+      // Se storeId é default_store, recuperar o real
+      if (storeId === 'default_store') {
+        storeId = await getActualStoreId();
+      }
       
       // Primeiro, tentar buscar por model_name (se a coluna existir)
       let { data, error } = await supabase
@@ -264,7 +355,12 @@ export const supabaseDB = {
     // Atualizar produtos existentes para ter model_name, color, size baseado no nome
     // Extrai do nome do produto: "Bruna Marrom M" -> model_name="Bruna", color="Marrom", size="M"
     updateProductsModelFields: async () => {
-      const storeId = getCurrentStoreId();
+      let storeId = getCurrentStoreId();
+      
+      // Se storeId é default_store, recuperar o real
+      if (storeId === 'default_store') {
+        storeId = await getActualStoreId();
+      }
       
       // Buscar todos os produtos que não têm model_name
       const { data: products, error } = await supabase

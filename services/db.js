@@ -45,13 +45,11 @@ const getCurrentTenantId = () => {
 
 const DB_KEY_DEFAULT = "mozyc_pdv_db_v2";
 
-// Dados iniciais com um ADMIN padrão
+// Dados iniciais (sem usuário padrão)
 const INITIAL_DB = {
   products: [],
   sales: [],
-  users: [
-    { id: 'admin', name: 'Adriano Admin', cpf: '00000000000', email: 'admin@lbbrand.com', password: '123456', role: 'admin', active: true }
-  ],
+  users: [],
   coupons: [
     { id: 'welcome', code: 'BEMVINDO10', discount: 10, active: true }
   ],
@@ -105,6 +103,36 @@ const loadDB = () => {
     return initialData;
   }
   const data = JSON.parse(str);
+  // Remover usuário padrão "Adriano Admin" caso exista no banco local
+  if (Array.isArray(data.users) && data.users.length > 0) {
+    const before = data.users.length;
+    data.users = data.users.filter(u =>
+      u.id !== 'admin' &&
+      u.email !== 'admin@lbbrand.com' &&
+      u.name !== 'Adriano Admin' &&
+      u.cpf !== '00000000000'
+    );
+    if (data.users.length !== before) {
+      saveDB(data);
+    }
+  }
+  // Limpar usuário atual se for o Adriano Admin
+  try {
+    const currentUserStr = localStorage.getItem('mozyc_pdv_current_user');
+    if (currentUserStr) {
+      const currentUser = JSON.parse(currentUserStr);
+      if (
+        currentUser?.id === 'admin' ||
+        currentUser?.email === 'admin@lbbrand.com' ||
+        currentUser?.name === 'Adriano Admin' ||
+        currentUser?.cpf === '00000000000'
+      ) {
+        localStorage.removeItem('mozyc_pdv_current_user');
+      }
+    }
+  } catch (e) {
+    // Ignorar falhas de parse
+  }
   // Run local migrations to ensure schema includes new sales metrics
   try {
     migrateLocalSalesSchema(data);
@@ -178,19 +206,22 @@ const syncProductsFromSupabase = async () => {
     try {
       const syncModule = await import('./supabaseSync.js');
       storeId = syncModule.resolveStoreId();
+      console.log('[syncProductsFromSupabase] StoreId resolvido:', storeId);
     } catch (e) {
       console.error('[syncProductsFromSupabase] Erro ao obter storeId:', e);
-      // Fallback: tentar obter do localStorage
-      const userStr = localStorage.getItem('mozyc_pdv_current_user');
-      if (userStr) {
-        try {
-          const user = JSON.parse(userStr);
-          if (user.store_id) {
-            storeId = user.store_id;
-          }
-        } catch (parseError) {
-          console.error('[syncProductsFromSupabase] Erro ao parsear usuário:', parseError);
-        }
+    }
+
+    // Carregar produtos locais PRIMEIRO
+    const data = loadDB();
+    const localProducts = data.products || [];
+    console.log(`[syncProductsFromSupabase] ${localProducts.length} produtos encontrados localmente`);
+
+    // IMPORTANTE: Se storeId não foi encontrado e há produtos locais, usar o store_id do primeiro produto local
+    if ((!storeId || storeId === 'default_store') && localProducts.length > 0) {
+      const firstLocalProduct = localProducts[0];
+      if (firstLocalProduct.store_id && firstLocalProduct.store_id !== 'default_store') {
+        console.log('[syncProductsFromSupabase] ⚠️ StoreId padrão detectado, usando store_id do primeiro produto local:', firstLocalProduct.store_id);
+        storeId = firstLocalProduct.store_id;
       }
     }
 
@@ -199,24 +230,10 @@ const syncProductsFromSupabase = async () => {
       return;
     }
 
-    // Carregar produtos do Supabase
+    // Carregar produtos do Supabase com o store_id correto
+    console.log('[syncProductsFromSupabase] Chamando sdb.products.list() com store_id:', storeId);
     const supabaseProducts = await sdb.products.list();
     console.log(`[syncProductsFromSupabase] ${supabaseProducts.length} produtos encontrados no Supabase`);
-    
-    // Log de estoque dos produtos do Supabase para debug
-    if (supabaseProducts.length > 0) {
-      console.log(`[syncProductsFromSupabase] Exemplo de estoque do Supabase:`, supabaseProducts.slice(0, 3).map(p => ({
-        id: p.id,
-        name: p.name,
-        stock: p.stock,
-        stock_quantity: p.stock_quantity
-      })));
-    }
-
-    // Carregar produtos locais
-    const data = loadDB();
-    const localProducts = data.products || [];
-    console.log(`[syncProductsFromSupabase] ${localProducts.length} produtos encontrados localmente`);
 
     // Carregar modelos para vincular modelId baseado em modelName
     const models = data.productModels || [];
@@ -342,6 +359,39 @@ const syncProductsFromSupabase = async () => {
 export const db = {
   // Função de sincronização exposta
   syncProducts: syncProductsFromSupabase,
+
+  // Função de DEBUG: listar TODOS os produtos do Supabase sem filtro (emergência)
+  debugListAllSupabaseProducts: async () => {
+    try {
+      const { supabase } = await import('./supabaseClient.js');
+      console.log('[DEBUG] Listando TODOS os produtos do Supabase (sem filtro)...');
+      
+      const { data, error } = await supabase
+        .from('products')
+        .select('id, name, store_id, sku')
+        .limit(100);
+      
+      if (error) {
+        console.error('[DEBUG] Erro ao listar produtos:', error);
+        return [];
+      }
+      
+      // Agrupar por store_id
+      const byStoreId = {};
+      (data || []).forEach(p => {
+        if (!byStoreId[p.store_id]) byStoreId[p.store_id] = [];
+        byStoreId[p.store_id].push(p);
+      });
+      
+      console.log('[DEBUG] Produtos por store_id:', byStoreId);
+      console.log('[DEBUG] Total de produtos:', data?.length || 0);
+      
+      return data || [];
+    } catch (e) {
+      console.error('[DEBUG] Erro ao listar todos os produtos:', e);
+      return [];
+    }
+  },
   
   products: {
     list: () => loadDB().products,
@@ -374,6 +424,11 @@ export const db = {
       // Para evitar duplicação, vamos verificar se já existe antes de adicionar
       const data = loadDB();
       
+      // IMPORTANTE: Garantir que o produto tem store_id
+      if (!prod.store_id) {
+        prod.store_id = 'default_store'; // Use fallback padrão
+      }
+      
       // Verificar se produto já existe (por ID ou código)
       const existingById = prod.id ? data.products.find(p => p.id === prod.id) : null;
       const existingByCode = prod.code ? data.products.find(p => p.code === prod.code) : null;
@@ -386,7 +441,7 @@ export const db = {
         data.products.push({ ...prod });
         addLog(data, user, `Cadastrou produto: ${prod.name}`);
         saveDB(data);
-        console.log(`[db.products.create] Produto adicionado ao localStorage: ${prod.name} (${prod.id})`);
+        console.log(`[db.products.create] Produto adicionado: ${prod.name} (${prod.id}) com store_id: ${prod.store_id}`);
       } else {
         // Produto já existe, atualizar com dados mais recentes
         const existingIndex = existingById 
@@ -396,7 +451,7 @@ export const db = {
         if (existingIndex > -1) {
           data.products[existingIndex] = { ...data.products[existingIndex], ...prod };
           saveDB(data);
-          console.log(`[db.products.create] Produto atualizado no localStorage: ${prod.name} (${prod.id})`);
+          console.log(`[db.products.create] Produto atualizado: ${prod.name} (${prod.id}) com store_id: ${prod.store_id}`);
         }
       }
     },
@@ -465,20 +520,28 @@ export const db = {
       const data = loadDB();
       const prod = data.products.find(p => p.id === id);
       
-      // Deletar do Supabase primeiro
+      // Deletar do Supabase primeiro quando disponível.
+      // Se a exclusão remota falhar, NÃO remover localmente para evitar inconsistência
       const sdb = await loadSupabaseDB();
       if (sdb && prod) {
         try {
-          await sdb.products.delete(id, user);
+          const result = await sdb.products.delete(id, user);
+          // Alguns adaptadores retornam objeto { success: true } ou lançam erro.
+          if (result && result.success === false) {
+            console.error('[db.products.delete] Supabase retornou falha ao deletar:', result);
+            throw new Error(result.message || 'Falha ao deletar produto no Supabase');
+          }
           console.log(`[db.products.delete] ✓ Produto deletado do Supabase: ${prod.name} (${id})`);
         } catch (error) {
           console.error('[db.products.delete] Erro ao deletar do Supabase:', error);
-          // Continuar deletando localmente mesmo se falhar no Supabase
+          // Não continuar — lançar erro para o chamador decidir. Isso impede que a UI mostre
+          // remoção local quando a remoção remota falhou (evita registros inconsistentes/null).
+          throw error;
         }
       }
-      
-      // SEMPRE deletar localmente, independente do resultado do Supabase
-      // Isso garante que o produto não apareça na UI mesmo se a exclusão do Supabase falhar
+
+      // Se chegou aqui: ou não havia Supabase (offline) ou a exclusão remota teve sucesso.
+      // Remover localmente apenas nesses casos.
       const productIndex = data.products.findIndex(p => p.id === id);
       if (productIndex > -1) {
         data.products.splice(productIndex, 1);
@@ -828,19 +891,26 @@ export const db = {
           console.warn('[productModels.delete] SupabaseDB não disponível, deletando apenas localmente');
         }
         
-        // Deletar modelo e produtos localmente (sempre, mesmo se falhar no Supabase)
+        // Se temos Supabase disponível e houve falhas ao deletar lá, abortar para evitar
+        // remoção local que deixaria dados inconsistentes (por exemplo registros "nulos").
+        if (sdb && supabaseErrorCount > 0) {
+          console.error('[productModels.delete] Existem erros ao deletar produtos no Supabase, abortando remoção local', supabaseErrors);
+          throw new Error('Falha ao deletar alguns produtos no Supabase. Operação abortada para evitar inconsistência local.');
+        }
+
+        // Deletar modelo e produtos localmente (apenas quando Supabase ausente ou remoção remota bem-sucedida)
         const productsBeforeDelete = data.products.length;
         data.productModels = data.productModels.filter(m => m.id !== id);
         data.products = data.products.filter(p => p.modelId !== id && p.modelName !== model.name);
         const productsAfterDelete = data.products.length;
         const productsDeleted = productsBeforeDelete - productsAfterDelete;
-        
+
         addLog(data, user, `Excluiu modelo e produtos associados: ${model.name}`);
         saveDB(data);
-        
+
         console.log(`[productModels.delete] ✓ Modelo e ${productsDeleted} produto(s) deletado(s) localmente`);
         console.log(`[productModels.delete] Exclusão concluída para modelo: ${model.name}`);
-        
+
         // Retornar resultado da exclusão
         return {
           success: true,
@@ -901,7 +971,7 @@ export const db = {
       saveDB(data);
       return newSale;
     },
-    cancel: (id, password, user) => {
+    cancel: async (id, password, user) => {
       const data = loadDB();
       const sale = data.sales.find(s => s.id === id);
       if (!sale) return { success: false, message: 'Venda não encontrada' };
@@ -917,13 +987,46 @@ export const db = {
         return { success: false, message: 'Apenas gerente, admin ou goodadmin podem cancelar vendas.' };
       }
 
-      // Estornar estoque
-      sale.items.forEach(item => {
+      // Estornar estoque (local + Supabase)
+      const sdb = await loadSupabaseDB();
+      for (const item of (sale.items || [])) {
+        // Local: atualizar ambos os campos
         const pIndex = data.products.findIndex(p => p.id === item.product_id);
         if (pIndex > -1) {
-          data.products[pIndex].stock = (data.products[pIndex].stock || 0) + item.quantity;
+          const currentStock = data.products[pIndex].stock !== undefined && data.products[pIndex].stock !== null
+            ? data.products[pIndex].stock
+            : (data.products[pIndex].stock_quantity || 0);
+          const newStock = currentStock + (item.quantity || 0);
+          data.products[pIndex].stock = newStock;
+          data.products[pIndex].stock_quantity = newStock;
         }
-      });
+
+        // Supabase: buscar produto e incrementar estoque
+        if (sdb) {
+          try {
+            let supaProduct = null;
+            if (item.product_id) {
+              supaProduct = await sdb.products.findById(item.product_id);
+            }
+            if (!supaProduct && item.code) {
+              supaProduct = await sdb.products.findByCode(item.code);
+            }
+            if (supaProduct) {
+              const current = supaProduct.stock !== undefined && supaProduct.stock !== null
+                ? supaProduct.stock
+                : (supaProduct.stock_quantity || 0);
+              const newStock = current + (item.quantity || 0);
+              await sdb.products.updateStock(supaProduct.id, newStock, {
+                name: user?.name || 'Sistema',
+                cpf: user?.cpf || '00000000000',
+                role: user?.role || 'admin'
+              });
+            }
+          } catch (err) {
+            console.error('[db.sales.cancel] Erro ao estornar estoque no Supabase:', err);
+          }
+        }
+      }
 
       // Marcar como cancelada
       sale.status = 'cancelled';

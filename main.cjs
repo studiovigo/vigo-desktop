@@ -63,8 +63,7 @@ function createWindow() {
   if (isDev) {
     // Em desenvolvimento, aponta para o servidor de desenvolvimento
     mainWindow.loadURL('http://localhost:5173');
-    // Abre o DevTools em desenvolvimento
-    mainWindow.webContents.openDevTools();
+    // DevTools não abre automaticamente
   } else {
     // Em produção, carrega os arquivos buildados
     const htmlPath = path.join(__dirname, 'dist', 'index.html');

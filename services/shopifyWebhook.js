@@ -67,18 +67,32 @@ export async function processShopifyWebhook(webhookData, topic = 'unknown', shop
         // ignore
       }
       
-      // Se encontrou o produto, atualizar estoque
-      if (product) {
+      // Atualizar estoque APENAS no Supabase (não usa localStorage)
+      if (product && productId) {
         const quantityToDeduct = item.quantity || 1;
         const currentStock = product.stock || 0;
         const newStock = Math.max(0, currentStock - quantityToDeduct);
         
-        // Atualizar estoque do produto (sem usuário, pois é automático)
-        db.products.update(product.id, { stock: newStock }, { 
-          name: "Sistema Shopify", 
-          cpf: "00000000000",
-          role: "admin"
-        });
+        console.log(`[Shopify Webhook] Decrementando estoque no Supabase: ${product.name} - ${currentStock} → ${newStock} (${quantityToDeduct} unid.)`);
+        
+        try {
+          // Atualizar estoque SOMENTE no Supabase
+          const sdb = await import('./supabaseDB.js').then(m => m.supabaseDB);
+          if (sdb) {
+            await sdb.products.updateStock(productId, newStock, {
+              name: "Sistema Shopify",
+              cpf: "00000000000",
+              role: "admin"
+            });
+            console.log(`[Shopify Webhook] ✓ Estoque atualizado no Supabase: ${product.name}`);
+          }
+        } catch (updateError) {
+          console.error(`[Shopify Webhook] ❌ Erro ao atualizar estoque de ${product.name}:`, updateError);
+        }
+      } else if (product && !productId) {
+        console.warn(`[Shopify Webhook] ⚠ Produto encontrado localmente mas sem ID do Supabase: ${productCode}`);
+      } else {
+        console.warn(`[Shopify Webhook] ⚠ Produto não encontrado para SKU: ${productCode}`);
       }
       
       return {
@@ -113,15 +127,18 @@ export async function processShopifyWebhook(webhookData, topic = 'unknown', shop
       shopifyOrderName: order.name || ""
     };
     
-    // Salvar pedido (sem usuário, pois é automático)
+    // Salvar pedido na aba Online (sem usuário, pois é automático)
+    console.log(`[Shopify Webhook] 📦 Salvando pedido #${newOrder.orderNumber} na aba Online`);
     const savedOrder = db.onlineOrders.create(newOrder, { 
       name: "Sistema", 
       cpf: "00000000000",
       role: "admin"
     });
+    console.log(`[Shopify Webhook] ✓ Pedido salvo com ID: ${savedOrder.id}`);
     
-    // Se foi pagamento do pedido, criar venda no Supabase
-    if ((topic || '').includes('orders/paid')) {
+    // Se foi pagamento do pedido (orders/paid), criar venda no Supabase e marcar como "processo"
+    if ((topic || '').includes('orders/paid') || (topic || '').includes('paid')) {
+      console.log(`[Shopify Webhook] 💳 Pedido PAGO - criando venda no Supabase...`);
       try {
         const external_id = (order.id ? `shopify-${order.id}` : crypto.randomUUID());
         const saleData = {
@@ -132,19 +149,33 @@ export async function processShopifyWebhook(webhookData, topic = 'unknown', shop
             sku: it.sku,
             name: it.name,
             price: it.price,
-          })),
+          })).filter(it => it.product_id), // Apenas itens com product_id encontrado
           total_amount: parseFloat(order.total_price || 0),
           payment_method: mapPaymentMethod(order),
           status: 'finalized'
         };
-        const result = await supabaseDB.sales.callCreateSaleAtomic(saleData, external_id);
-        if (result.status === 'ok' && result.sale_id) {
-          // vincular o pedido online à venda
-          await db.onlineOrders.update(savedOrder.id, { saleId: result.sale_id, status: 'processo' }, { name: 'Sistema', cpf: '00000000000', role: 'admin' });
+        
+        // Só criar venda se houver itens válidos
+        if (saleData.items.length > 0) {
+          const result = await supabaseDB.sales.callCreateSaleAtomic(saleData, external_id);
+          if (result.status === 'ok' && result.sale_id) {
+            // Vincular o pedido online à venda e marcar como "em processo"
+            await db.onlineOrders.update(savedOrder.id, { 
+              saleId: result.sale_id, 
+              status: 'processo' 
+            }, { name: 'Sistema', cpf: '00000000000', role: 'admin' });
+            console.log(`[Shopify Webhook] ✓ Venda criada no Supabase (ID: ${result.sale_id}) e pedido atualizado para status 'processo'`);
+          } else {
+            console.warn(`[Shopify Webhook] ⚠ Falha ao criar venda no Supabase:`, result);
+          }
+        } else {
+          console.warn(`[Shopify Webhook] ⚠ Nenhum item válido encontrado para criar venda no Supabase`);
         }
       } catch (err) {
-        console.error('Erro ao criar venda no Supabase via webhook:', err);
+        console.error('[Shopify Webhook] ❌ Erro ao criar venda no Supabase:', err);
       }
+    } else {
+      console.log(`[Shopify Webhook] ℹ Pedido registrado como "aguardando" (não é orders/paid)`);
     }
     
     return { success: true, order: savedOrder };

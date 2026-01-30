@@ -1,0 +1,28 @@
+# Configuração do Agente VIGO SISTEM Sync
+client_id = "e2af0917315986fbedaa3f1d9cba0e6a"
+name = "VIGO SISTEM sync"
+handle = "vigo-sistem-sync-1"
+application_url = "https://example.com"
+embedded = true
+
+[build]
+automatically_update_urls_on_dev = true
+dev_store_url = "lb-test-6909.myshopify.com"
+
+[access_scopes]
+# Estas são as permissões essenciais que discutimos para o PDV
+scopes = "write_products,read_products,write_inventory,read_inventory,read_orders,read_locations"
+
+[auth]
+redirect_urls = [
+  "https://example.com/auth/callback",
+  "https://example.com/auth/shopify/callback",
+  "https://example.com/api/auth/callback"
+]
+
+[webhooks]
+api_version = "2026-01"
+
+[[webhooks.subscriptions]]
+topics = [ "orders/paid" ]
+uri = "/api/webhooks"
