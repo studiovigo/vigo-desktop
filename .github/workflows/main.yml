@@ -16,7 +16,7 @@ jobs:
       with:
         server: ${{ secrets.ftp_host }}
         username: ${{ secrets.ftp_user }}
-        password: ${{ secrets.ftp_password }}
-        server-dir: /public_html/
-        local-dir: ./
+        password: ${{ secrets.ftp_key }}
+        server-dir: //v1go.art/
+        local-dir: ./lbpdv
         dangerous-clean-slate: true
