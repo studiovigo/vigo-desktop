@@ -259,17 +259,45 @@ export function generateInvoice(sale, items, settings, user, invoiceType = 'prev
 </html>
   `;
 
-  // Abrir janela de impressão
-  const printWindow = window.open('', '_blank');
-  printWindow.document.write(invoiceHTML);
-  printWindow.document.close();
+  // Criar iframe oculto para impressão (evita bloqueio de popup)
+  const printFrame = document.createElement('iframe');
+  printFrame.style.position = 'fixed';
+  printFrame.style.right = '0';
+  printFrame.style.bottom = '0';
+  printFrame.style.width = '0';
+  printFrame.style.height = '0';
+  printFrame.style.border = 'none';
+  document.body.appendChild(printFrame);
   
-  // Aguardar carregamento e imprimir automaticamente
-  printWindow.onload = () => {
+  const frameDoc = printFrame.contentWindow || printFrame.contentDocument;
+  const doc = frameDoc.document || frameDoc;
+  
+  doc.open();
+  doc.write(invoiceHTML);
+  doc.close();
+  
+  // Aguardar carregamento e imprimir
+  printFrame.onload = () => {
     setTimeout(() => {
-      printWindow.print();
-    }, 250);
+      try {
+        printFrame.contentWindow.focus();
+        printFrame.contentWindow.print();
+      } catch (e) {
+        console.error('[invoice] Erro ao imprimir:', e);
+        // Fallback: abrir em nova aba
+        const blob = new Blob([invoiceHTML], { type: 'text/html' });
+        const url = URL.createObjectURL(blob);
+        window.open(url, '_blank');
+      }
+      
+      // Remover iframe após impressão (com delay para não cancelar impressão)
+      setTimeout(() => {
+        document.body.removeChild(printFrame);
+      }, 1000);
+    }, 300);
   };
+  
+  console.log('[invoice] ✅ Nota fiscal gerada:', invoiceType === 'nfce' ? 'NFC-e' : 'Pré-venda');
 }
 
 function getPaymentMethodName(method) {

@@ -144,7 +144,7 @@ function SignupRequest({ onClose, onSuccess }) {
           cpf_cnpj: formData.cpf_cnpj.replace(/\D/g, ''),
           phone: formData.phone.replace(/\D/g, ''),
           email: formData.email.trim().toLowerCase(),
-          password_hash: formData.password, // Em produção, fazer hash aqui ou no backend
+          password_hashed: formData.password, // Em produção, fazer hash bcrypt aqui ou no backend
           status: 'pending'
         }])
         .select()
@@ -550,31 +550,28 @@ function Login({ onLogin }) {
           user.role = 'caixa'; // Default
         }
         
-        // IMPORTANTE: Garantir que o usuário tem store_id
-        // Prioridade: store_id > tenantId > calculado do email
-        if (!user.store_id && user.tenantId) {
-          user.store_id = user.tenantId;
+        // IMPORTANTE: Preservar store_id do Supabase (UUID)
+        // Se já tem store_id válido (UUID), NÃO sobrescrever
+        const hasValidStoreId = user.store_id && 
+          user.store_id !== 'default_store' &&
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(user.store_id);
+        
+        if (!hasValidStoreId) {
+          // Tentar obter store_id do tenantId ou calcular fallback
+          if (user.tenantId && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(user.tenantId)) {
+            user.store_id = user.tenantId;
+          } else if (user.tenant_id && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(user.tenant_id)) {
+            user.store_id = user.tenant_id;
+          } else {
+            console.warn('[Login] Usuário sem store_id UUID válido, verificando banco...');
+            // Não sobrescrever com email calculado - deixar o sistema buscar do Supabase
+          }
         }
         
-        // Calcular e atribuir tenantId se não existir
-        if (user.role === 'admin' && user.email) {
-          // ADMIN usa email como tenantId
-          const calculatedTenantId = user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
-          user.tenantId = user.tenantId || calculatedTenantId;
-          user.store_id = user.store_id || calculatedTenantId; // IMPORTANTE: também atribuir ao store_id
-        } else if (!user.tenantId) {
-          // GERENTE/CAIXA herda tenantId do admin que os criou
-          // Se não tiver, busca o tenantId do admin no sistema
-          const data = db.users.list();
-          const admin = data.find(u => u.role === 'admin');
-          if (admin && admin.email) {
-            const adminTenantId = admin.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
-            user.tenantId = adminTenantId;
-            user.store_id = user.store_id || adminTenantId; // IMPORTANTE: também atribuir ao store_id
-          } else {
-            user.tenantId = 'default';
-            user.store_id = user.store_id || 'default'; // IMPORTANTE: também atribuir ao store_id
-          }
+        // Sincronizar tenantId com store_id
+        if (user.store_id) {
+          user.tenantId = user.store_id;
+          user.tenant_id = user.store_id;
         }
         
         console.log('[Login] Usuário preparado para salvar:', {
@@ -1161,9 +1158,9 @@ function SettingsPage({ user }) {
   };
 
 
-  const refreshData = () => {
+  const refreshData = async () => {
     setLogs(db.logs.list());
-    setUsers(db.users.list());
+    setUsers(await db.users.list());
     // Buscar cupons do SBD primeiro, fallback para localStorage
     const loadCoupons = async () => {
       try {
@@ -1356,7 +1353,7 @@ function SettingsPage({ user }) {
       if (user?.email && user?.id) {
         // TODO: Implementar deleção via Supabase se necessário
         // Por enquanto, usar método local
-        const users = db.users.list();
+        const users = await db.users.list();
         const userToDeleteData = users.find(u => u.id === userToDelete.id);
         if (userToDeleteData) {
           userToDeleteData.active = false;
@@ -1853,18 +1850,36 @@ function POS({ user }) {
   
   // Salva carrinho no localStorage sempre que mudar (isolado por tenant)
   useEffect(() => {
-    const tenantId = user.tenantId || 'default';
-    localStorage.setItem(`mozyc_pdv_cart_${tenantId}`, JSON.stringify(cart));
+    try {
+      const tenantId = user.tenantId || 'default';
+      localStorage.setItem(`mozyc_pdv_cart_${tenantId}`, JSON.stringify(cart));
+    } catch (e) {
+      // Se localStorage estiver cheio, limpar dados antigos
+      console.warn('[PDV] localStorage cheio, limpando dados antigos...');
+      try {
+        // Limpar caches antigos
+        Object.keys(localStorage).forEach(key => {
+          if (key.includes('_cache_') || key.includes('_versions_') || key.includes('mozyc_pdv_db_v2')) {
+            localStorage.removeItem(key);
+          }
+        });
+        // Tentar salvar novamente
+        const tenantId = user.tenantId || 'default';
+        localStorage.setItem(`mozyc_pdv_cart_${tenantId}`, JSON.stringify(cart));
+      } catch (e2) {
+        console.error('[PDV] Não foi possível salvar carrinho:', e2);
+      }
+    }
   }, [cart, user.tenantId]);
   
   // Função para processar código de barras lido
-  const processBarcode = (code) => {
+  const processBarcode = async (code) => {
     if (!code || code.trim() === '') return;
     
     const trimmedCode = code.trim();
     
     // Prioriza busca por código exato
-    const byCode = db.products.findByCode(trimmedCode);
+    const byCode = await db.products.findByCode(trimmedCode);
     if (byCode) {
       add(byCode);
       setTerm('');
@@ -1872,8 +1887,8 @@ function POS({ user }) {
     }
     
     // Tenta encontrar por modelCode ou trecho
-    const all = db.products.list();
-    const found = all.find(p => 
+    const all = await db.products.list();
+    const found = (all || []).find(p => 
       (p.code || '').toLowerCase() === trimmedCode.toLowerCase() || 
       (p.modelCode || '').toLowerCase() === trimmedCode.toLowerCase()
     );
@@ -1900,31 +1915,48 @@ function POS({ user }) {
 
 
   useEffect(() => {
-    // Sincronizar produtos do Supabase ao carregar o PDV
-    const syncProductsOnLoad = async () => {
+    // Carregar produtos - tentar cache primeiro para resposta instantânea
+    const loadProducts = async () => {
       try {
-        // Sincronizar produtos do Supabase para db.products
+        const sdb = await import('./services/supabaseDB.js').then(m => m.supabaseDB);
+        
+        // Tentar carregar do cache primeiro (instantâneo)
+        const cachedProducts = sdb.products.getFromCache?.();
+        if (cachedProducts && cachedProducts.length > 0) {
+          setProducts(cachedProducts);
+          console.log('[PDV] ✅ Carregado do cache:', cachedProducts.length, 'produtos');
+          
+          // Sincronizar em background (não bloquear UI)
+          db.syncProducts().then(async () => {
+            const freshProducts = await db.products.list();
+            if (freshProducts && freshProducts.length > 0) {
+              setProducts(freshProducts);
+            }
+          }).catch(() => {});
+          return;
+        }
+        
+        // Se não tem cache, fazer sincronização completa
         await db.syncProducts();
-        // Atualizar lista de produtos após sincronização
-    const allProducts = db.products.list();
-    setProducts(allProducts);
-        console.log('[PDV] Produtos sincronizados:', allProducts.length);
+        const allProducts = await db.products.list();
+        setProducts(allProducts || []);
+        console.log('[PDV] Produtos sincronizados:', (allProducts || []).length);
       } catch (error) {
-        console.error('[PDV] Erro ao sincronizar produtos:', error);
-        // Continuar com produtos locais mesmo se falhar
-        const allProducts = db.products.list();
-        setProducts(allProducts);
+        console.error('[PDV] Erro ao carregar produtos:', error);
+        // Tentar carregar do db mesmo com erro
+        try {
+          const allProducts = await db.products.list();
+          setProducts(allProducts || []);
+        } catch (e) {}
       }
     };
     
-    syncProductsOnLoad();
+    loadProducts();
     
-    // REFATORAÇÃO: Verificar se há caixa aberto ao carregar PDV
-    // (Não precisa fazer nada, apenas garantir que o sistema sabe que há caixa)
+    // Verificar se há caixa aberto ao carregar PDV
     const cash = JSON.parse(localStorage.getItem('currentCashRegister') || 'null');
     if (!cash) {
       // Se não há caixa aberto, avisar o usuário (opcional)
-      // console.log('Nenhum caixa aberto. Abra o caixa na aba Relatórios antes de fazer vendas.');
     }
   }, []);
 
@@ -2044,29 +2076,12 @@ function POS({ user }) {
 
 
   const finish = useCallback(() => {
-    console.log('[finish] 🚀 Iniciando processo de finalização...');
-    console.log('[finish] Método de pagamento:', payMethod);
-    console.log('[finish] Total final:', totalFinal);
-    
-    // Validação para pagamento em dinheiro: só bloqueia se o valor recebido for explicitamente menor que o total
-    // Se o campo estiver vazio, considera que o valor recebido é igual ao total (sem troco) e permite confirmar
-    if(payMethod === "money") {
-      console.log('[finish] Validando pagamento em dinheiro...');
-      console.log('[finish] Valor recebido:', moneyReceived);
-      
-      // Se o campo estiver vazio, permite confirmar (considera valor recebido = total, sem troco)
-      if (moneyReceived && moneyReceived.trim() !== "") {
-        const received = parseFloat(moneyReceived);
-        console.log('[finish] Valor recebido (parsed):', received);
-        
-        if (received < totalFinal) {
-          console.log('[finish] ❌ Valor insuficiente!');
-          return alert("Valor recebido insuficiente!");
-        }
-        console.log('[finish] ✅ Valor suficiente');
-        // Se received >= totalFinal, permite confirmar (com ou sem troco)
+    // Validação para pagamento em dinheiro
+    if(payMethod === "money" && moneyReceived && moneyReceived.trim() !== "") {
+      const received = parseFloat(moneyReceived);
+      if (received < totalFinal) {
+        return alert("Valor recebido insuficiente!");
       }
-      // Se moneyReceived estiver vazio, permite confirmar normalmente (sem troco)
     }
 
     // Preparar método de pagamento com tipo de PIX se aplicável
@@ -2074,88 +2089,89 @@ function POS({ user }) {
     if (payMethod === 'pix') {
       finalPaymentMethod = `pix_${pixType}`;
     }
-    console.log('[finish] Método de pagamento final:', finalPaymentMethod);
     
-    // REFATORAÇÃO: Obter ID do caixa atual do localStorage
+    // Obter caixa atual
     const cash = JSON.parse(localStorage.getItem('currentCashRegister') || 'null');
-    console.log('[finish] Caixa atual:', cash);
-    
     if (!cash) {
-      console.log('[finish] ❌ Nenhum caixa aberto!');
       alert('Erro: Nenhum caixa aberto. Abra o caixa antes de realizar vendas.');
       return;
     }
 
-    // Obter usuário logado do localStorage (fallback quando state não está acessível aqui)
+    // Obter usuário logado
     const loggedUserStr = localStorage.getItem('mozyc_pdv_current_user');
     const loggedUser = loggedUserStr ? JSON.parse(loggedUserStr) : null;
     
-    console.log('[finish] Preparando items da venda...');
-    
-    // Garantir que os items tenham SKU (code) para a RPC
+    // Preparar items da venda
     const saleData = { 
       sale_date: new Date().toISOString(), 
       items: cart.map(i => {
-        // Buscar produto completo para garantir que temos o SKU
-        const product = products.find(p => p.id === i.pid);
-        const sku = product?.code || product?.sku || i.code || i.sku || null;
+        // Buscar produto completo
+        let product = (products || []).find(p => p.id === i.pid);
+        if (!product && (i.code || i.sku)) {
+          product = (products || []).find(p => 
+            (p.code && p.code === (i.code || i.sku)) || 
+            (p.sku && p.sku === (i.code || i.sku))
+          );
+        }
         
-        // Validar se tem SKU antes de continuar
+        const sku = product?.code || product?.sku || i.code || i.sku || null;
+        const product_id = product?.id || i.pid;
+        
         if (!sku) {
           console.error('[finish] ⚠️ Item sem SKU encontrado:', {
             item: i,
             product: product,
-            product_id: i.pid
+            product_id: product_id
           });
         }
         
+        // Montar product_specs conforme esperado pelo banco de dados
+        const product_specs = {
+          sku: sku,
+          model_name: product?.model_name || product?.modelName || null,
+          color: product?.color || null,
+          size: product?.size || null,
+          cost_price: product?.cost_price || product?.costPrice || 0,
+          tax_percentage: product?.tax_percentage || product?.taxPercentage || 0,
+          ncm: product?.ncm || null,
+        };
+        
         return {
-          product_id: i.pid,
+          product_id: product_id, // UUID correto do produto no Supabase
           quantity: i.qtd,
           code: sku, // SKU é obrigatório para a RPC
           sku: sku, // Garantir ambos os campos
           name: i.name || product?.name || 'Produto',
+          product_name: i.name || product?.name || 'Produto', // Nome do produto para histórico
+          product_specs: product_specs, // Detalhes do produto para histórico
           price: i.price || product?.salePrice || 0,
+          cost_price: product?.cost_price || product?.costPrice || 0, // Custo unitário
           subtotal: (i.price || product?.salePrice || 0) * i.qtd,
-          ...i
+          ...i,
+          // Sobrescrever pid com product_id correto
+          pid: product_id
         };
       }), 
       total_amount: totalFinal, 
       payment_method: finalPaymentMethod,
       discount: discountAmount,
-      cashRegisterId: cash.id, // VÍNCULO COM O CAIXA ATUAL
-      user_name: (loggedUser?.name || loggedUser?.email?.split('@')[0] || 'Usuário'), // Nome do usuário logado
-      user_id: (loggedUser?.id ?? null) // ID do usuário logado
+      cashRegisterId: cash.id,
+      user_name: (loggedUser?.name || loggedUser?.email?.split('@')[0] || 'Usuário'),
+      user_id: (loggedUser?.id ?? null)
     };
     
-    console.log('[finish] Sale data preparado:', saleData);
-    
-    // Validar se todos os items têm SKU antes de continuar
+    // Validar se todos os items têm SKU
     const itemsWithoutSKU = saleData.items.filter(i => !i.code && !i.sku);
     if (itemsWithoutSKU.length > 0) {
       const productNames = itemsWithoutSKU.map(i => i.name).join(', ');
-      console.log('[finish] ❌ Items sem SKU:', itemsWithoutSKU);
       alert(`❌ Erro: Os seguintes produtos não têm SKU (código) cadastrado:\n\n${productNames}\n\nPor favor, cadastre o SKU para estes produtos antes de realizar a venda.`);
       return;
     }
-    
-    // Log dos items para debug
-    console.log('[finish] Items da venda preparados:', saleData.items.map(i => ({
-      product_id: i.product_id,
-      code: i.code,
-      sku: i.sku,
-      quantity: i.quantity,
-      name: i.name
-    })));
-    
-    console.log('[finish] ✅ Validações passadas! Abrindo modal NFC-e...');
     
     // Salvar dados da venda pendente e mostrar modal NFC-e/Pré-venda
     setPendingSale({ saleData, cart, change });
     setShowPayModal(false);
     setShowNFCeModal(true);
-    
-    console.log('[finish] 🎉 Finalizou! Modal NFC-e deve estar visível agora.');
   }, [payMethod, pixType, moneyReceived, totalFinal, discountAmount, cart, products]);
   
   // Iniciar worker da fila unificada (SQLite/localStorage)
@@ -2207,36 +2223,16 @@ function POS({ user }) {
     const external_id = crypto.randomUUID();
     
     // ============================================
-    // 2. TENTAR EXECUTAR callCreateSaleAtomic
+    // 2. CRIAR VENDA - MÉTODO DIRETO
     // ============================================
     let result;
     let createdSale;
     
     try {
-        console.log('[finalizeSale] Tentando criar venda atomicamente:', {
-          external_id,
-          items: saleData.items.map(i => ({
-            product_id: i.product_id,
-            code: i.code,
-            sku: i.sku,
-            quantity: i.quantity,
-            name: i.name
-          })),
-          total: saleData.total_amount,
-          payment_method: saleData.payment_method
-        });
-      
-      result = await Promise.race([
-        supabaseDB.sales.callCreateSaleAtomic(saleData, external_id),
-        new Promise((_, reject) => 
-          setTimeout(() => reject(new Error('Timeout')), 10000) // 10s timeout
-        )
-      ]);
-      
-      console.log('[finalizeSale] Resultado da RPC:', result);
+      // Criar venda no Supabase (sem timeout - deixar completar)
+      result = await supabaseDB.sales.createSaleDirect(saleData, external_id);
     } catch (error) {
-      // Timeout ou erro de rede
-      console.error('[finalizeSale] Erro ao criar venda atomicamente:', error);
+      console.error('[finalizeSale] Erro:', error.message);
       result = { status: 'error', message: error.message || 'Erro de conexão' };
     }
     
@@ -2245,7 +2241,6 @@ function POS({ user }) {
     // ============================================
     if (result.status === 'ok') {
       // ✅ SUCESSO: Venda criada no Supabase
-      // A RPC create_sale_atomic já atualizou o estoque no Supabase
       // Calcular métricas para relatório (total_cost, profit_amount, total_net, discount, items_count, metadata)
       let total_cost = 0;
       let items_count = 0;
@@ -2260,7 +2255,8 @@ function POS({ user }) {
           else if (item.costPrice !== undefined) cost = Number(item.costPrice) || 0;
 
           try {
-            const prod = db.products.list().find(p => p.id === item.product_id);
+            const productsList = await db.products.list();
+            const prod = (productsList || []).find(p => p.id === item.product_id);
             if (prod) {
               cost = cost || Number(prod.costPrice || prod.cost_price || 0);
             }
@@ -2298,109 +2294,21 @@ function POS({ user }) {
         user_id: saleData.user_id || (loggedUser?.id ?? null)
       };
       
-      // Sincronizar produtos do Supabase para pegar estoque atualizado pela RPC
-      // Aguardar um pouco para garantir que a RPC terminou de atualizar o estoque
-      try {
-        console.log('[finalizeSale] Aguardando 1s antes de sincronizar produtos (garantir que RPC terminou)...');
-        await new Promise(resolve => setTimeout(resolve, 1000));
-        
-        // Verificar estoque diretamente no Supabase ANTES de sincronizar
-        if (saleData.items && Array.isArray(saleData.items)) {
-          // Importar supabaseDB para verificar estoque diretamente
-          const { supabaseDB: sdb } = await import('./services/supabaseDB.js');
-          if (sdb) {
-            const storeId = resolveStoreId();
-            const { supabase } = await import('./services/supabaseClient.js');
-            
-            for (const item of saleData.items) {
-              const itemSKU = item.code || item.sku;
-              if (itemSKU || item.product_id) {
-                try {
-                  // Buscar produto por SKU primeiro (mais confiável), depois por ID
-                  let supabaseProduct = null;
-                  let error = null;
-                  
-                  if (itemSKU) {
-                    const { data, error: err } = await supabase
-                      .from('products')
-                      .select('id, name, sku, stock, stock_quantity')
-                      .eq('sku', itemSKU)
-                      .eq('store_id', storeId)
-                      .maybeSingle();
-                    supabaseProduct = data;
-                    error = err;
-                  }
-                  
-                  // Se não encontrou por SKU, tentar por ID
-                  if (!supabaseProduct && item.product_id) {
-                    const { data, error: err } = await supabase
-                      .from('products')
-                      .select('id, name, sku, stock, stock_quantity')
-                      .eq('id', item.product_id)
-                      .eq('store_id', storeId)
-                      .maybeSingle();
-                    supabaseProduct = data;
-                    error = err;
-                  }
-                  
-                  if (supabaseProduct && !error) {
-                    const supabaseStock = supabaseProduct.stock !== undefined && supabaseProduct.stock !== null ? supabaseProduct.stock : (supabaseProduct.stock_quantity || 0);
-                    console.log(`[finalizeSale] 📊 Estoque DIRETO do Supabase: ${supabaseProduct.name} (SKU: ${supabaseProduct.sku || 'N/A'}) - ${supabaseStock} unidades (vendeu ${item.quantity})`);
-                  } else if (error) {
-                    console.error(`[finalizeSale] Erro ao buscar produto no Supabase (SKU: ${itemSKU || 'N/A'}, ID: ${item.product_id || 'N/A'}):`, error);
-                  }
-                } catch (e) {
-                  console.error(`[finalizeSale] Erro ao verificar estoque no Supabase (SKU: ${itemSKU || 'N/A'}):`, e);
-                }
-              } else {
-                console.warn(`[finalizeSale] ⚠️ Item sem SKU nem product_id:`, item);
-              }
-            }
-          }
+      // ✅ Venda salva no Supabase - sincronizar produtos em BACKGROUND (não bloquear UI)
+      // Não precisa esperar - a venda já foi salva e o estoque já foi atualizado no Supabase
+      setTimeout(async () => {
+        try {
+          await db.syncProducts();
+          const updatedProducts = await db.products.list();
+          setProducts(updatedProducts || []);
+          console.log('[finalizeSale] ✅ Produtos sincronizados em background');
+        } catch (error) {
+          console.error('[finalizeSale] Erro ao sincronizar produtos em background:', error);
         }
-        
-        // Log do estoque ANTES da sincronização
-        if (saleData.items && Array.isArray(saleData.items)) {
-          for (const item of saleData.items) {
-            if (item.product_id) {
-              const productBefore = db.products.list().find(p => p.id === item.product_id);
-              if (productBefore) {
-                const stockBefore = productBefore.stock !== undefined && productBefore.stock !== null ? productBefore.stock : (productBefore.stock_quantity || 0);
-                console.log(`[finalizeSale] Estoque ANTES da sincronização (local): ${productBefore.name} - ${stockBefore} unidades (vendeu ${item.quantity})`);
-              }
-            }
-          }
-        }
-        
-        await db.syncProducts();
-        console.log('[finalizeSale] Produtos sincronizados do Supabase após venda');
-        
-        // Atualizar lista de produtos na UI
-        const updatedProducts = db.products.list();
-        setProducts(updatedProducts);
-        console.log(`[finalizeSale] UI atualizada com ${updatedProducts.length} produtos`);
-        
-        // Verificar estoque atualizado para cada produto vendido
-        if (saleData.items && Array.isArray(saleData.items)) {
-          for (const item of saleData.items) {
-            if (item.product_id) {
-              const product = updatedProducts.find(p => p.id === item.product_id);
-              if (product) {
-                // PRIORIZAR campo stock (coluna principal do Supabase)
-                const currentStock = product.stock !== undefined && product.stock !== null ? product.stock : (product.stock_quantity || 0);
-                console.log(`[finalizeSale] ✅ Estoque APÓS sincronização: ${product.name} - ${currentStock} unidades`);
-              } else {
-                console.error(`[finalizeSale] ❌ Produto não encontrado após sincronização: ${item.product_id}`);
-              }
-            }
-          }
-        }
-      } catch (error) {
-        console.error('[finalizeSale] Erro ao sincronizar produtos após venda:', error);
-      }
+      }, 100);
       
-      // ✅ Venda salva no Supabase e localmente para consistência do relatório
-      db.sales.create(createdSale, user); // Salva a venda no localStorage
+      // Salvar venda no localStorage para consistência do relatório
+      db.sales.create(createdSale, user);
       console.log('[finalizeSale] ✅ Venda salva no Supabase e LOCALMENTE (ID: %s)', createdSale.id);
       
     } else if (result.status === 'insufficient_stock') {
@@ -2445,15 +2353,10 @@ function POS({ user }) {
         return;
       }
       
-      // Se for erro de SKU não encontrado, mostrar mensagem específica
-      if (errorMessage.includes('SKU: N/A') || errorMessage.includes('Produto não encontrado')) {
-        alert(`❌ Erro ao finalizar venda!\n\nProduto não encontrado. Verifique se os produtos têm SKU (código) cadastrado.\n\nErro: ${errorMessage}`);
-        finalizingRef.current = false;
-        setIsFinalizing(false);
-        return;
-      }
+      // Mostrar erro específico
+      alert(`❌ Erro ao finalizar venda!\n\nNão foi possível registrar a venda no banco de dados.\n\nErro: ${errorMessage}`);
       
-      // Adicionar à fila de vendas pendentes para retry automático (apenas se não for erro de configuração)
+      // Adicionar à fila de vendas pendentes para retry automático
       await enqueuePendingSale({
         sale: { ...saleData, store_id: saleData.store_id || resolveStoreId() },
         externalId: external_id,
@@ -2465,9 +2368,6 @@ function POS({ user }) {
       const newCount = await getPendingSalesCount();
       setPendingSalesCountState(newCount);
 
-      // Mostrar erro ao usuário e não finalizar a venda
-      alert(`❌ Erro ao finalizar venda!\n\n${errorMessage}\n\nA venda foi adicionada à fila e será sincronizada automaticamente quando possível.`);
-      
       // Reset finalizing flags antes de retornar
       finalizingRef.current = false;
       setIsFinalizing(false);
@@ -2480,45 +2380,44 @@ function POS({ user }) {
     // ============================================
     // Só gerar nota se a venda foi salva com sucesso no Supabase
     if (createdSale && createdSale.id) {
-    const settings = db.settings.get();
-      // Passar o tipo de nota (prevenda ou nfce)
-      generateInvoice(createdSale, saleCart, settings, user, saleType);
-      
-      // Mensagem de confirmação única: "Sua compra foi confirmada"
-      // Só mostra troco se houver troco a devolver
-      const changeMessage = saleData.payment_method === "money" && change > 0 
-        ? `\n\nDevolva ${formatCurrency(change)}` 
-        : "";
-      alert(`Sua compra foi confirmada!${changeMessage}`);
-      
-      // Fechar todos os modais
+      // Fechar modais PRIMEIRO para evitar que fique travado
       setShowPayModal(false);
       setShowNFCeModal(false);
       
-      // Limpar tudo
-    setCart([]);
-    localStorage.removeItem('mozyc_pdv_cart'); // Limpa carrinho do localStorage
+      // Limpar carrinho e estados IMEDIATAMENTE (UX mais rápida)
+      setCart([]);
+      localStorage.removeItem('mozyc_pdv_cart');
       setPendingSale(null);
-    setMoneyReceived("");
-    setPayMethod("money");
-    setPixType("maquina");
-    setAppliedDiscount(0);
-    setDiscountCode("");
+      setMoneyReceived("");
+      setPayMethod("money");
+      setPixType("maquina");
+      setAppliedDiscount(0);
+      setDiscountCode("");
       
-      // Recarregar produtos após venda (sincronizar do Supabase)
+      // Reset flags ANTES de mostrar nota (permite nova venda imediatamente)
+      finalizingRef.current = false;
+      setIsFinalizing(false);
+      
+      // Gerar nota fiscal (não bloqueia UI)
       try {
-        await db.syncProducts();
-    setProducts(db.products.list());
-        console.log('[finalizeSale] Produtos recarregados após venda');
-      } catch (error) {
-        console.error('[finalizeSale] Erro ao recarregar produtos:', error);
-        setProducts(db.products.list()); // Fallback para produtos locais
+        const settings = db.settings.get();
+        generateInvoice(createdSale, saleCart, settings, user, saleType);
+      } catch (invoiceError) {
+        console.error('[finalizeSale] Erro ao gerar nota fiscal:', invoiceError);
       }
+      
+      // Mostrar confirmação com troco se aplicável
+      const changeMessage = saleData.payment_method === "money" && change > 0 
+        ? `\n\nTroco: ${formatCurrency(change)}` 
+        : "";
+      alert(`✅ Venda finalizada!${changeMessage}`);
+      
+      return; // Sair - sincronização já está rodando em background
     } else {
       // Se não há createdSale, a venda falhou e já foi tratada acima
       console.warn('[finalizeSale] Venda não foi criada, não gerando nota fiscal');
     }
-    // Reset finalizing flags (sucesso/fluxo normal)
+    // Reset finalizing flags (caso de erro)
     finalizingRef.current = false;
     setIsFinalizing(false);
   };
@@ -2698,7 +2597,7 @@ function POS({ user }) {
 
         {/* Lista de Produtos - Abaixo do campo BIP */}
         <div className="flex-1 overflow-y-auto space-y-2 pr-2">
-          {products.filter(p => {
+          {(products || []).filter(p => {
             const searchTerm = term.toLowerCase();
             return (
               p.modelName?.toLowerCase().includes(searchTerm) ||
@@ -2753,7 +2652,7 @@ function POS({ user }) {
               </Card>
             );
           })}
-          {products.filter(p => {
+          {(products || []).filter(p => {
             const searchTerm = term.toLowerCase();
             return (
               p.modelName?.toLowerCase().includes(searchTerm) ||
@@ -3376,6 +3275,7 @@ function BarcodeScannerModal({ onClose, onScan }) {
 // Página de Produtos - Cadastro por Modelo
 function Products({ user }) {
   const [models, setModels] = useState([]);
+  const [products, setProducts] = useState([]); // Lista de produtos do Supabase
   const [searchTerm, setSearchTerm] = useState("");
   const [showModal, setShowModal] = useState(false);
   const [selectedModel, setSelectedModel] = useState(null);
@@ -3406,208 +3306,99 @@ function Products({ user }) {
   const sizes = ["PP", "P", "M", "G", "GG", "XG", "XXG"];
 
   // Função para reconstruir modelos baseados nos produtos do Supabase
+  // Simplificada: cria modelos em memória diretamente dos produtos
   const rebuildModelsFromProducts = async () => {
     try {
-      const allProducts = db.products.list();
-      const existingModels = db.productModels.list();
+      const allProducts = await db.products.list();
       
-      // Agrupar produtos por modelName (ou modelId se modelName não existir)
-      const productsByModel = {};
-      
-      allProducts.forEach(product => {
-        // Usar modelName como chave principal, ou modelId como fallback
-        const modelKey = product.modelName || product.modelId || product.name?.split(' ')[0] || 'Sem Modelo';
-        
-        if (!productsByModel[modelKey]) {
-          productsByModel[modelKey] = {
-            modelName: product.modelName || modelKey,
-            modelId: product.modelId || null,
-            products: []
-          };
-        }
-        
-        productsByModel[modelKey].products.push(product);
-      });
-      
-      // Para cada grupo de produtos, criar ou atualizar modelo
-      for (const [modelKey, modelData] of Object.entries(productsByModel)) {
-        if (modelData.products.length === 0) continue;
-        
-        // Pegar o primeiro produto como referência
-        const firstProduct = modelData.products[0];
-        
-        // Verificar se modelo já existe
-        let existingModel = null;
-        
-        if (modelData.modelId) {
-          // Tentar encontrar por ID
-          existingModel = existingModels.find(m => m.id === modelData.modelId);
-        }
-        
-        if (!existingModel) {
-          // Tentar encontrar por nome
-          existingModel = existingModels.find(m => 
-            m.name === modelData.modelName || 
-            m.name === firstProduct.modelName
-          );
-        }
-        
-        if (!existingModel) {
-          // Criar novo modelo baseado no primeiro produto
-          const baseCode = (firstProduct.code || firstProduct.sku || modelKey.slice(0, 3).toUpperCase()).replace(/[^A-Z0-9]/g, '');
-          const modelCode = baseCode + Math.random().toString(36).slice(2, 6).toUpperCase();
-          
-          const newModel = {
-            id: modelData.modelId || crypto.randomUUID(),
-            name: modelData.modelName || firstProduct.name?.split(' ')[0] || 'Produto',
-            code: modelCode,
-            costPrice: firstProduct.costPrice || firstProduct.cost_price || 0,
-            salePrice: firstProduct.salePrice || firstProduct.sale_price || firstProduct.price || 0,
-            taxPercentage: firstProduct.taxPercentage || 0,
-            ncm: firstProduct.ncm || null,
-            image: firstProduct.image || null
-          };
-          
-          // Salvar modelo usando a função do db (que atualiza localStorage corretamente)
-          // Como não temos acesso direto ao saveDB, vamos usar uma abordagem diferente
-          // Vamos criar o modelo através de uma função auxiliar
-          const currentModels = db.productModels.list();
-          currentModels.push(newModel);
-          
-          // Atualizar localStorage usando a mesma lógica do db.js
-          const tenantId = (() => {
-            try {
-              const userStr = localStorage.getItem('mozyc_pdv_current_user');
-              if (userStr) {
-                const user = JSON.parse(userStr);
-                if (user.role === 'admin' && user.email) {
-                  return user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
-                }
-                if (user.tenantId) {
-                  return user.tenantId;
-                }
-              }
-            } catch (e) {}
-            return null;
-          })();
-          
-          const dbKey = tenantId ? `mozyc_pdv_db_v2_tenant_${tenantId}` : 'mozyc_pdv_db_v2';
-          const dbData = JSON.parse(localStorage.getItem(dbKey) || '{}');
-          if (!dbData.productModels) dbData.productModels = [];
-          dbData.productModels.push(newModel);
-          localStorage.setItem(dbKey, JSON.stringify(dbData));
-          
-          console.log(`[rebuildModelsFromProducts] Modelo criado: ${newModel.name} (${newModel.id})`);
-        } else {
-          // Atualizar modelo existente se necessário
-          let needsUpdate = false;
-          const updatedModel = { ...existingModel };
-          
-          // Atualizar preços se diferentes (usar valores do primeiro produto como referência)
-          const firstCostPrice = firstProduct.costPrice || firstProduct.cost_price || 0;
-          const firstSalePrice = firstProduct.salePrice || firstProduct.sale_price || firstProduct.price || 0;
-          const firstTaxPercentage = firstProduct.taxPercentage || 0;
-          const firstNcm = firstProduct.ncm || null;
-          
-          if (firstCostPrice > 0 && existingModel.costPrice !== firstCostPrice) {
-            updatedModel.costPrice = firstCostPrice;
-            needsUpdate = true;
-          }
-          if (firstSalePrice > 0 && existingModel.salePrice !== firstSalePrice) {
-            updatedModel.salePrice = firstSalePrice;
-            needsUpdate = true;
-          }
-          if (firstTaxPercentage > 0 && existingModel.taxPercentage !== firstTaxPercentage) {
-            updatedModel.taxPercentage = firstTaxPercentage;
-            needsUpdate = true;
-          }
-          if (firstNcm && existingModel.ncm !== firstNcm) {
-            updatedModel.ncm = firstNcm;
-            needsUpdate = true;
-          }
-          if (firstProduct.image && existingModel.image !== firstProduct.image) {
-            updatedModel.image = firstProduct.image;
-            needsUpdate = true;
-          }
-          
-          if (needsUpdate) {
-            // Atualizar modelo no localStorage
-            const tenantId = (() => {
-              try {
-                const userStr = localStorage.getItem('mozyc_pdv_current_user');
-                if (userStr) {
-                  const user = JSON.parse(userStr);
-                  if (user.role === 'admin' && user.email) {
-                    return user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
-                  }
-                  if (user.tenantId) {
-                    return user.tenantId;
-                  }
-                }
-              } catch (e) {}
-              return null;
-            })();
-            
-            const dbKey = tenantId ? `mozyc_pdv_db_v2_tenant_${tenantId}` : 'mozyc_pdv_db_v2';
-            const dbData = JSON.parse(localStorage.getItem(dbKey) || '{}');
-            if (dbData.productModels) {
-              const index = dbData.productModels.findIndex(m => m.id === existingModel.id);
-              if (index > -1) {
-                dbData.productModels[index] = updatedModel;
-                localStorage.setItem(dbKey, JSON.stringify(dbData));
-                console.log(`[rebuildModelsFromProducts] Modelo atualizado: ${updatedModel.name}`);
-              }
-            }
-          }
-        }
+      if (!allProducts || allProducts.length === 0) {
+        console.log('[rebuildModelsFromProducts] Nenhum produto encontrado');
+        return [];
       }
       
-      console.log(`[rebuildModelsFromProducts] Reconstrução concluída: ${Object.keys(productsByModel).length} modelo(s) processado(s)`);
+      // Agrupar produtos por modelName (ou usar nome do produto como fallback)
+      const modelMap = new Map();
+      
+      allProducts.forEach(product => {
+        // Usar modelName ou model_name como chave, ou nome do produto
+        const modelName = product.modelName || product.model_name || product.name?.split(' ')[0] || 'Produto';
+        
+        if (!modelMap.has(modelName)) {
+          modelMap.set(modelName, {
+            id: product.modelId || crypto.randomUUID(),
+            name: modelName,
+            code: (product.sku || product.code || modelName.slice(0, 3).toUpperCase()).replace(/[^A-Z0-9]/gi, '').slice(0, 6).toUpperCase(),
+            costPrice: product.cost_price || product.costPrice || 0,
+            salePrice: product.sale_price || product.salePrice || product.price || 0,
+            taxPercentage: product.tax_percentage || product.taxPercentage || 0,
+            ncm: product.ncm || null,
+            image: product.image || null,
+            products: []
+          });
+        }
+        
+        modelMap.get(modelName).products.push(product);
+      });
+      
+      // Converter Map para array de modelos
+      const newModels = Array.from(modelMap.values()).map(m => ({
+        id: m.id,
+        name: m.name,
+        code: m.code,
+        costPrice: m.costPrice,
+        salePrice: m.salePrice,
+        taxPercentage: m.taxPercentage,
+        ncm: m.ncm,
+        image: m.image
+      }));
+      
+      console.log(`[rebuildModelsFromProducts] ${newModels.length} modelo(s) criado(s) a partir de ${allProducts.length} produto(s)`);
+      
+      // Retornar modelos para uso direto (não salvar no localStorage para evitar quota)
+      return newModels;
     } catch (error) {
-      console.error('[rebuildModelsFromProducts] Erro ao reconstruir modelos:', error);
+      console.error('[rebuildModelsFromProducts] Erro:', error);
+      return [];
     }
   };
 
   useEffect(() => {
-    // Sincronizar produtos do Supabase ao carregar a página
+    // SEMPRE sincronizar com Supabase ao entrar na aba de produtos
     const syncProductsOnLoad = async () => {
       setIsSyncing(true);
       setSyncStatus({ type: null, message: null });
       
       try {
-        // Atualizar produtos existentes no Supabase com model_name, color, size
-        try {
-          const sdb = await import('./services/supabaseDB.js').then(m => m.supabaseDB);
-          if (sdb && sdb.products.updateProductsModelFields) {
-            console.log('[Products] Atualizando produtos existentes com model_name, color, size...');
-            const result = await sdb.products.updateProductsModelFields();
-            if (result.updated > 0) {
-              console.log(`[Products] ✓ ${result.updated} produtos atualizados com model_name`);
-            }
-          }
-        } catch (updateError) {
-          console.warn('[Products] Erro ao atualizar produtos existentes (pode ser que as colunas não existam ainda):', updateError);
-          // Não bloquear a sincronização se falhar
+        // Limpar cache para forçar busca do Supabase
+        const sdb = await import('./services/supabaseDB.js').then(m => m.supabaseDB);
+        if (sdb.products.clearCache) {
+          sdb.products.clearCache();
         }
         
+        // Sincronizar com Supabase
         await db.syncProducts();
-        console.log('[Products] Produtos sincronizados do Supabase');
         
-        // Reconstruir modelos baseados nos produtos do Supabase
-        await rebuildModelsFromProducts();
+        // Carregar produtos atualizados
+        const allProducts = await db.products.list();
+        setProducts(allProducts || []);
         
-        setSyncStatus({ type: 'success', message: 'Produtos sincronizados com sucesso!' });
-        setTimeout(() => setSyncStatus({ type: null, message: null }), 3000);
+        // Reconstruir modelos diretamente dos produtos
+        const rebuiltModels = await rebuildModelsFromProducts();
+        setModels(rebuiltModels || []);
+        console.log('[Products] ✅ Sincronizado do Supabase:', (allProducts || []).length, 'produtos');
+        
+        setSyncStatus({ type: 'success', message: 'Atualizado!' });
+        setTimeout(() => setSyncStatus({ type: null, message: null }), 2000);
       } catch (error) {
         console.error('[Products] Erro ao sincronizar produtos:', error);
-        setSyncStatus({ type: 'error', message: 'Erro ao sincronizar produtos. Verifique sua conexão.' });
-        setTimeout(() => setSyncStatus({ type: null, message: null }), 5000);
+        setSyncStatus({ type: 'error', message: 'Erro ao sincronizar.' });
+        setTimeout(() => setSyncStatus({ type: null, message: null }), 3000);
       } finally {
         setIsSyncing(false);
-    refreshModels();
       }
     };
     
+    // Executar sincronização ao entrar na aba
     syncProductsOnLoad();
   }, []);
 
@@ -3628,8 +3419,10 @@ function Products({ user }) {
     };
   }, []);
 
-  const refreshModels = () => {
-    setModels(db.productModels.list());
+  const refreshModels = async () => {
+    // Reconstruir modelos diretamente dos produtos
+    const rebuiltModels = await rebuildModelsFromProducts();
+    setModels(rebuiltModels || []);
   };
 
   // Funções de Exportar/Importar Estoque
@@ -4009,34 +3802,80 @@ function Products({ user }) {
   };
 
   const getModelProducts = (modelId) => {
-    const allProducts = db.products.list();
+    // Usar products do state
+    const allProducts = products || [];
     const model = models.find(m => m.id === modelId);
     if (!model) return [];
     
-    // Buscar produtos por modelId OU modelName
-    return allProducts.filter(p => 
-      p.modelId === modelId || 
-      p.modelName === model.name ||
-      (p.modelName && model.name && p.modelName.toLowerCase() === model.name.toLowerCase())
-    );
+    // Buscar produtos por modelId OU modelName OU model_name (snake_case do Supabase)
+    return allProducts.filter(p => {
+      const productModelName = p.modelName || p.model_name || '';
+      const modelName = model.name || '';
+      
+      return (
+        p.modelId === modelId || 
+        productModelName === modelName ||
+        (productModelName && modelName && productModelName.toLowerCase() === modelName.toLowerCase()) ||
+        // Fallback: verificar se o nome do produto começa com o nome do modelo
+        (p.name && modelName && p.name.toLowerCase().startsWith(modelName.toLowerCase()))
+      );
+    });
   };
 
   const getModelStock = (modelId) => {
-    const products = getModelProducts(modelId);
+    const modelProducts = getModelProducts(modelId);
     // PRIORIZAR campo stock (coluna principal do Supabase)
-    return products.reduce((sum, p) => {
+    return modelProducts.reduce((sum, p) => {
       const stock = p.stock !== undefined && p.stock !== null ? p.stock : (p.stock_quantity || 0);
       return sum + stock;
     }, 0);
   };
 
   const getVariationsSummary = (modelId) => {
-    const products = getModelProducts(modelId);
+    const modelProducts = getModelProducts(modelId);
     const summary = {};
-    products.forEach(p => {
-      const key = `${p.color}-${p.size}`;
+    
+    // Cores e tamanhos conhecidos para extração do nome
+    const knownColors = ['Preto', 'Branco', 'Verde', 'Azul', 'Vermelho', 'Amarelo', 'Rosa', 'Cinza', 'Marrom', 'Bege', 'Laranja', 'Roxo'];
+    const knownSizes = ['PP', 'P', 'M', 'G', 'GG', 'XG', 'XXG', 'XGG', '36', '38', '40', '42', '44', '46', '48'];
+    
+    modelProducts.forEach(p => {
+      // Extrair cor e tamanho do produto
+      let color = p.color;
+      let size = p.size;
+      
+      // Se não tiver cor/tamanho, tentar extrair do nome
+      if (!color || !size) {
+        const productName = p.name || '';
+        const nameParts = productName.split(' ');
+        
+        // Procurar cor no nome
+        if (!color) {
+          for (const part of nameParts) {
+            if (knownColors.some(c => c.toLowerCase() === part.toLowerCase())) {
+              color = part;
+              break;
+            }
+          }
+        }
+        
+        // Procurar tamanho no nome
+        if (!size) {
+          for (const part of nameParts) {
+            if (knownSizes.some(s => s.toLowerCase() === part.toLowerCase())) {
+              size = part.toUpperCase();
+              break;
+            }
+          }
+        }
+      }
+      
+      color = color || 'Sem cor';
+      size = size || 'Único';
+      const key = `${color}-${size}`;
+      
       if (!summary[key]) {
-        summary[key] = { color: p.color, size: p.size, quantity: 0 };
+        summary[key] = { color, size, quantity: 0 };
       }
       // PRIORIZAR campo stock (coluna principal do Supabase)
       const stock = p.stock !== undefined && p.stock !== null ? p.stock : (p.stock_quantity || 0);
@@ -4045,12 +3884,13 @@ function Products({ user }) {
     return Object.values(summary);
   };
 
-  const filteredModels = models.filter(m => {
+  const filteredModels = (models || []).filter(m => {
     const q = (searchTerm || '').toLowerCase().trim();
     if (!q) return true;
     if (m.name?.toLowerCase().includes(q)) return true;
     if (m.code?.toLowerCase().includes(q)) return true;
-    const prods = db.products.listByModel(m.id);
+    // Usar getModelProducts em vez de db.products.listByModel (que é async)
+    const prods = getModelProducts(m.id);
     return prods.some(p => (
       (p.code || '').toLowerCase().includes(q) ||
       (p.color || '').toLowerCase().includes(q) ||
@@ -4217,7 +4057,7 @@ function Products({ user }) {
               Os produtos do Supabase precisam estar associados a modelos para aparecer aqui.
             </p>
             <p className="text-xs text-gray-400">
-              Total de produtos sincronizados: {db.products.list().length}
+              Total de modelos: {models.length}
             </p>
           </Card>
         ) : (
@@ -4254,7 +4094,7 @@ function Products({ user }) {
                         onClick={() => {
                           setSelectedModelForPrint(model);
                           const products = getModelProducts(model.id);
-                            setSelectedProducts(products.map(p => ({ 
+                            setSelectedProducts((products || []).map(p => ({ 
                               ...p, 
                               selected: true,
                               printQuantity: 1 // Inicializar quantidade com 1
@@ -5037,12 +4877,12 @@ function Dashboard({ user }) {
           return;
         }
         // Fallback para localStorage
-        const localSales = db.sales.listFinalized() || [];
+        const localSales = await db.sales.listFinalized() || [];
         setSales(localSales);
     } catch (error) {
         console.error('[Dashboard] Erro ao carregar vendas do SBD, usando localStorage:', error);
         // Fallback para localStorage
-        const localSales = db.sales.listFinalized() || [];
+        const localSales = await db.sales.listFinalized() || [];
         setSales(localSales);
     }
     };
@@ -5071,7 +4911,7 @@ function Dashboard({ user }) {
     });
 
     // Preferir campo `total_cost` vindo da venda, se existir; caso contrário calcular por item
-    const productsList = db.products.list();
+    const productsList = products || [];
     let costs = 0;
     monthSales.forEach(sale => {
       if (sale.total_cost !== undefined && sale.total_cost !== null) {
@@ -5508,12 +5348,12 @@ function Dashboard({ user }) {
   };
 
   // Exportar fechamento (para Dashboard)
-  const exportClosureDashboard = (closure) => {
+  const exportClosureDashboard = async (closure) => {
     const closureDate = closure.date ? format(new Date(closure.date), "dd/MM/yyyy") : format(new Date(), "dd/MM/yyyy");
     const closureTime = format(new Date(closure.created_at || new Date()), "HH:mm");
     let managerName = closure.created_by || 'Sistema';
     try {
-      const usersList = db.users.list() || [];
+      const usersList = await db.users.list() || [];
       const found = usersList.find(u => u.id === closure.created_by || u.email === closure.created_by || u.tenantId === closure.created_by);
       if (found && found.name) managerName = found.name;
     } catch (e) {
@@ -5743,7 +5583,8 @@ function Dashboard({ user }) {
       date: format(new Date(), "yyyy-MM-dd"),
       category: "",
       description: "",
-      amount: ""
+      amount: "",
+      frequency: "rotativa" // 'fixa' ou 'rotativa'
     });
   };
 
@@ -5753,7 +5594,8 @@ function Dashboard({ user }) {
       date: expense.date ? format(new Date(expense.date), "yyyy-MM-dd") : format(new Date(), "yyyy-MM-dd"),
       category: expense.category || "",
       description: expense.description || "",
-      amount: expense.amount?.toString() || ""
+      amount: expense.amount?.toString() || "",
+      frequency: expense.frequency || "rotativa" // 'fixa' ou 'rotativa'
     });
     setShowExpenseModal(true);
   };
@@ -6049,7 +5891,8 @@ function Dashboard({ user }) {
                   date: format(new Date(), "yyyy-MM-dd"),
                   category: "",
                   description: "",
-                  amount: ""
+                  amount: "",
+                  frequency: "rotativa" // 'fixa' ou 'rotativa'
                 });
                 setShowExpenseModal(true);
               }}
@@ -6183,6 +6026,34 @@ function Dashboard({ user }) {
                 />
               </div>
 
+              <div>
+                <label className="block text-sm font-medium mb-1">Tipo de Despesa *</label>
+                <div className="flex gap-4">
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="frequency"
+                      value="rotativa"
+                      checked={expenseForm.frequency === 'rotativa'}
+                      onChange={(e) => setExpenseForm({...expenseForm, frequency: e.target.value})}
+                      className="w-4 h-4 text-[#d9b53f]"
+                    />
+                    <span className="text-sm">Rotativa (eventual)</span>
+                  </label>
+                  <label className="flex items-center gap-2 cursor-pointer">
+                    <input
+                      type="radio"
+                      name="frequency"
+                      value="fixa"
+                      checked={expenseForm.frequency === 'fixa'}
+                      onChange={(e) => setExpenseForm({...expenseForm, frequency: e.target.value})}
+                      className="w-4 h-4 text-[#d9b53f]"
+                    />
+                    <span className="text-sm">Fixa (mensal)</span>
+                  </label>
+                </div>
+              </div>
+
               <div className="flex gap-3 mt-6">
                 <Button
                   type="button"
@@ -6216,17 +6087,8 @@ function Dashboard({ user }) {
               {closures.map(closure => {
                 const closureDate = format(new Date(closure.date), "dd/MM/yyyy");
                 const closureTime = format(new Date(closure.created_at), "HH:mm");
-                // Priorizar nome resolvido (quando carregado do SBD), senão tentar tabela local
+                // Priorizar nome resolvido (quando carregado do SBD), senão usar created_by
                 let authorName = closure.created_by_name || closure.created_by;
-                try {
-                  if (!closure.created_by_name) {
-                    const usersList = db.users.list() || [];
-                    const found = usersList.find(u => u.id === closure.created_by || u.email === closure.created_by || u.tenantId === closure.created_by || u.store_id === closure.created_by || u.storeId === closure.created_by);
-                    if (found && found.name) authorName = found.name;
-                  }
-                } catch (e) {
-                  // fallback: manter closure.created_by ou created_by_name
-                }
                 const fileName = `${closureDate} - ${authorName} - ${closureTime}`;
                 
                 return (
@@ -6739,28 +6601,78 @@ function Reports({ user }) {
     }
   }, []);
 
-  // REFATORAÇÃO: Buscar vendas filtradas por cashRegisterId (não por data)
-  // CORREÇÃO: usar apenas localStorage como fonte para evitar duplicação e respeitar status (incluindo canceladas)
-  const refreshSales = useCallback(() => {
-    const cash = JSON.parse(localStorage.getItem('currentCashRegister') || 'null');
-    
-    if (!cash) {
-      // Se não há caixa aberto, as listas ficam vazias
+  // REFATORAÇÃO: Buscar vendas do SUPABASE como fonte principal
+  // Mostra APENAS vendas feitas APÓS a abertura do caixa atual
+  const refreshSales = useCallback(async () => {
+    try {
+      const { supabaseDB } = await import('./services/supabaseDB.js');
+      
+      // Buscar caixa atual do localStorage
+      const cash = JSON.parse(localStorage.getItem('currentCashRegister') || 'null');
+      
+      // Se não tem caixa aberto, não mostrar vendas
+      if (!cash) {
+        console.log('[Reports] Sem caixa aberto - limpando vendas');
+        setFinalizedSales([]);
+        setCancelledSales([]);
+        return;
+      }
+      
+      // Verificar se o caixa foi fechado
+      const allReports = JSON.parse(localStorage.getItem('reports') || '[]');
+      const wasClosed = allReports.some(r => r.cashRegisterId === cash.id);
+      
+      if (wasClosed) {
+        console.log('[Reports] Caixa foi fechado - limpando vendas');
+        setFinalizedSales([]);
+        setCancelledSales([]);
+        return;
+      }
+      
+      // Data de abertura do caixa (usar openedAt ou created_at)
+      const cashOpenedAt = cash.openedAt || cash.created_at;
+      if (!cashOpenedAt) {
+        console.log('[Reports] Caixa sem data de abertura - limpando vendas');
+        setFinalizedSales([]);
+        setCancelledSales([]);
+        return;
+      }
+      
+      const filterDate = new Date(cashOpenedAt);
+      console.log('[Reports] Caixa aberto em:', filterDate.toISOString());
+      console.log('[Reports] ID do caixa:', cash.id);
+      
+      // Buscar vendas do Supabase
+      const sbdFinalized = await supabaseDB.sales.listFinalized();
+      const sbdCancelled = await supabaseDB.sales.listCancelled();
+      
+      console.log('[Reports] Total vendas no Supabase:', sbdFinalized?.length || 0, 'finalizadas,', sbdCancelled?.length || 0, 'canceladas');
+      
+      // Filtrar vendas feitas APÓS a abertura do caixa atual
+      const finalized = (sbdFinalized || []).filter(s => {
+        const saleDate = new Date(s.created_at || s.sale_date);
+        const isAfterOpen = saleDate >= filterDate;
+        if (!isAfterOpen) {
+          console.log('[Reports] Venda descartada (antes do caixa):', s.id?.slice(0, 8), saleDate.toISOString());
+        }
+        return isAfterOpen;
+      });
+      const cancelled = (sbdCancelled || []).filter(s => {
+        const saleDate = new Date(s.created_at || s.sale_date);
+        return saleDate >= filterDate;
+      });
+      
+      setFinalizedSales(finalized);
+      setCancelledSales(cancelled);
+      
+      console.log('[Reports] ✅ Vendas após abertura:', finalized.length, 'finalizadas,', cancelled.length, 'canceladas');
+    } catch (error) {
+      console.error('[Reports] Erro ao buscar vendas do Supabase:', error);
+      
+      // Fallback: limpar se houver erro
       setFinalizedSales([]);
       setCancelledSales([]);
-      return;
     }
-
-    // Buscar vendas do banco local (db) e filtrar pelo caixa atual
-    const allLocalSales = db.sales.list();
-    const currentSales = Array.isArray(allLocalSales) ? allLocalSales.filter(sale => sale.cashRegisterId === cash.id) : [];
-    
-    // Separar finalizadas e canceladas
-    const finalized = currentSales.filter(s => s.status !== 'cancelled' && s.status !== 'canceled');
-    const cancelled = currentSales.filter(s => s.status === 'cancelled' || s.status === 'canceled');
-    
-    setFinalizedSales(finalized);
-    setCancelledSales(cancelled);
   }, [currentCashOpening]);
 
   // REFATORAÇÃO: Restaurar caixa do localStorage ao carregar componente
@@ -7202,12 +7114,12 @@ function Reports({ user }) {
       const sbdFinalized = await supabaseDB.sales.listFinalized();
       const sbdCancelled = await supabaseDB.sales.listCancelled();
       // Preferir SBD como fonte da verdade (mesmo vazio)
-      allFinalizedSales = Array.isArray(sbdFinalized) ? sbdFinalized : db.sales.listFinalized();
-      allCancelledSales = Array.isArray(sbdCancelled) ? sbdCancelled : db.sales.listCancelled();
+      allFinalizedSales = Array.isArray(sbdFinalized) ? sbdFinalized : await db.sales.listFinalized();
+      allCancelledSales = Array.isArray(sbdCancelled) ? sbdCancelled : await db.sales.listCancelled();
     } catch (error) {
       console.error('[Reports] Erro ao carregar vendas do SBD, usando localStorage:', error);
-      allFinalizedSales = db.sales.listFinalized();
-      allCancelledSales = db.sales.listCancelled();
+      allFinalizedSales = await db.sales.listFinalized();
+      allCancelledSales = await db.sales.listCancelled();
     }
 
     // CORREÇÃO: Vendas apenas após o último fechamento (ou abertura se não houver fechamento)
@@ -7259,7 +7171,7 @@ function Reports({ user }) {
 
       // Calcular custos dos itens vendidos
       sale.items?.forEach(item => {
-        const product = db.products.list().find(p => p.id === item.product_id);
+        const product = (products || []).find(p => p.id === item.product_id);
         if (product && product.costPrice) {
           totalCosts += (product.costPrice * item.quantity);
         }
@@ -7473,8 +7385,8 @@ function Reports({ user }) {
         const storeId = resolveStoreId();
         
         // Também salvar no cache de produtos (para compatibilidade)
-        const products = db.products.list();
-        const productVersions = products
+        const syncedProducts = await db.products.list();
+        const productVersions = (syncedProducts || [])
           .filter(p => p.updated_at)
           .map(p => ({
             id: p.id,
@@ -7483,13 +7395,16 @@ function Reports({ user }) {
         
         // Salvar produtos no cache local (formato Supabase)
         const cacheKey = `products_cache_${storeId}`;
-        localStorage.setItem(cacheKey, JSON.stringify(products));
+        localStorage.setItem(cacheKey, JSON.stringify(syncedProducts || []));
         
         // Salvar product_versions
         const versionsKey = `product_versions_${storeId}`;
         localStorage.setItem(versionsKey, JSON.stringify(productVersions));
         
-        console.log(`[confirmOpenCash] ✅ ${products.length} produtos sincronizados e disponíveis`);
+        // Atualizar state de produtos
+        setProducts(syncedProducts || []);
+        
+        console.log(`[confirmOpenCash] ✅ ${(syncedProducts || []).length} produtos sincronizados e disponíveis`);
       } catch (error) {
         console.error('[confirmOpenCash] ❌ Erro ao sincronizar produtos:', error);
         // Continuar mesmo se houver erro ao sincronizar produtos
@@ -7542,7 +7457,7 @@ function Reports({ user }) {
     }
   };
 
-  // REFATORAÇÃO: Abrir modal de fechamento usando apenas vendas do caixa atual
+  // REFATORAÇÃO: Abrir modal de fechamento usando vendas do SUPABASE
   const handleCloseCash = async () => {
     // Permitir que qualquer usuário veja as informações de fechamento
     // A senha de gerente/admin será solicitada na confirmação
@@ -7554,14 +7469,55 @@ function Reports({ user }) {
       return;
     }
     
-    // Buscar vendas apenas do caixa atual (usar banco local `db`)
-    const allSales = db.sales.list();
-    const salesOfCurrentCash = Array.isArray(allSales) ? allSales.filter(s => s.cashRegisterId === cash.id && s.status !== 'cancelled' && s.status !== 'canceled') : [];
-    const cancelledOfCurrentCash = Array.isArray(allSales) ? allSales.filter(
-      s => (s.status === 'cancelled' || s.status === 'canceled') && s.cashRegisterId === cash.id
-    ) : [];
+    console.log('[handleCloseCash] Buscando vendas do Supabase para o caixa:', cash.id);
+    
+    // Buscar vendas do SUPABASE para o caixa atual
+    let salesOfCurrentCash = [];
+    let cancelledOfCurrentCash = [];
+    const storeId = user?.store_id || localStorage.getItem('store_id');
+    
+    try {
+      // Buscar vendas finalizadas
+      const { data: finalizedSales, error: salesError } = await supabase
+        .from('sales')
+        .select('*')
+        .eq('store_id', storeId)
+        .eq('status', 'finalized')
+        .gte('created_at', cash.openedAt || new Date().toISOString().split('T')[0]);
+      
+      if (salesError) {
+        console.error('[handleCloseCash] Erro ao buscar vendas:', salesError);
+      } else {
+        salesOfCurrentCash = finalizedSales || [];
+        console.log('[handleCloseCash] Vendas finalizadas encontradas:', salesOfCurrentCash.length);
+      }
+      
+      // Buscar vendas canceladas
+      const { data: cancelledSales, error: cancelledError } = await supabase
+        .from('sales')
+        .select('*')
+        .eq('store_id', storeId)
+        .eq('status', 'cancelled')
+        .gte('created_at', cash.openedAt || new Date().toISOString().split('T')[0]);
+      
+      if (cancelledError) {
+        console.error('[handleCloseCash] Erro ao buscar canceladas:', cancelledError);
+      } else {
+        cancelledOfCurrentCash = cancelledSales || [];
+        console.log('[handleCloseCash] Vendas canceladas encontradas:', cancelledOfCurrentCash.length);
+      }
+    } catch (error) {
+      console.error('[handleCloseCash] Erro ao buscar vendas do Supabase:', error);
+      // Fallback para localStorage
+      const allSales = await db.sales.list();
+      salesOfCurrentCash = Array.isArray(allSales) ? allSales.filter(s => s.cashRegisterId === cash.id && s.status !== 'cancelled' && s.status !== 'canceled') : [];
+      cancelledOfCurrentCash = Array.isArray(allSales) ? allSales.filter(
+        s => (s.status === 'cancelled' || s.status === 'canceled') && s.cashRegisterId === cash.id
+      ) : [];
+    }
 
-    const userLookup = db.users.list().reduce((acc, u) => {
+    const usersArray = await db.users.list();
+    const userLookup = (usersArray || []).reduce((acc, u) => {
       acc[u.id] = u.name || u.cpf || u.email || 'Caixa';
       return acc;
     }, {});
@@ -7572,35 +7528,61 @@ function Reports({ user }) {
     let totalDiscounts = 0;
     let totalCosts = 0;
 
+    // Buscar custos dos produtos do Supabase
+    let productsMap = {};
+    try {
+      const { data: supabaseProducts } = await supabase
+        .from('products')
+        .select('id, cost_price, costPrice')
+        .eq('store_id', storeId);
+      
+      if (supabaseProducts) {
+        supabaseProducts.forEach(p => {
+          productsMap[p.id] = Number(p.cost_price || p.costPrice) || 0;
+        });
+        console.log('[handleCloseCash] Produtos para cálculo de custo:', Object.keys(productsMap).length);
+      }
+    } catch (error) {
+      console.error('[handleCloseCash] Erro ao buscar produtos:', error);
+    }
+
     salesOfCurrentCash.forEach(sale => {
       const method = sale.payment_method || 'money';
       if (!paymentMethods[method]) {
         paymentMethods[method] = 0;
       }
-      paymentMethods[method] += sale.total_amount;
-      totalSales += sale.total_amount;
-      totalDiscounts += sale.discount || 0;
+      paymentMethods[method] += Number(sale.total_amount) || 0;
+      totalSales += Number(sale.total_amount) || 0;
+      totalDiscounts += Number(sale.discount_amount || sale.discount) || 0;
 
-      sale.items?.forEach(item => {
-        const product = db.products.list().find(p => p.id === item.product_id);
-        if (product && product.costPrice) {
-          totalCosts += (product.costPrice * item.quantity);
-        }
+      // Calcular custos dos itens vendidos
+      const items = sale.items || [];
+      items.forEach(item => {
+        // Pegar custo do item (salvo na venda) ou buscar do produto
+        const costPrice = Number(item.cost_price || item.costPrice) || productsMap[item.product_id] || 0;
+        const quantity = Number(item.quantity || item.qtd) || 1;
+        totalCosts += costPrice * quantity;
       });
     });
 
-    // Canceladas não entram no total de vendas (já filtradas em salesOfCurrentCash)
+    console.log('[handleCloseCash] Totais calculados:', {
+      totalSales,
+      totalCosts,
+      totalDiscounts,
+      paymentMethods
+    });
 
     const today = new Date();
-    const dayExpenses = db.expenses.list().filter(expense => {
+    const dayExpenses = db.expenses?.list ? db.expenses.list().filter(expense => {
       const expenseDate = new Date(expense.date);
       return expenseDate.toISOString().split('T')[0] === today.toISOString().split('T')[0];
-    });
+    }) : [];
     const totalExpenses = dayExpenses.reduce((sum, e) => sum + (e.amount || 0), 0);
-    // Lucro Bruto: Vendas - Abertura - Custos
-    const grossProfit = totalSales - cash.openingValue - totalCosts;
-    // Valor final no caixa agora considera custos em vez de despesas
-    const finalCashAmount = cash.openingValue + totalSales - totalCosts;
+    
+    // Lucro Bruto: Vendas - Custos
+    const grossProfit = totalSales - totalCosts;
+    // Valor final no caixa: Abertura + Vendas - Custos
+    const finalCashAmount = (cash.openingValue || 0) + totalSales - totalCosts;
 
     const cashiers = buildCashierBreakdown(salesOfCurrentCash, cancelledOfCurrentCash, userLookup);
 
@@ -7615,11 +7597,13 @@ function Reports({ user }) {
       totalDiscounts,
       grossProfit,
       paymentMethods,
-      openingAmount: cash.openingValue,
+      openingAmount: cash.openingValue || 0,
       finalCashAmount,
       cashRegisterId: cash.id,
       cashiers
     };
+
+    console.log('[handleCloseCash] closureData preparado:', closureData);
 
     setClosureData(closureData);
     setClosurePassword("");
@@ -7696,7 +7680,7 @@ function Reports({ user }) {
         }
       } else {
         // Fallback para localStorage
-        const users = db.users.list();
+        const users = await db.users.list();
         const foundUser = users.find(u => 
           u.id === user?.id && 
           u.password === closurePassword
@@ -7744,240 +7728,68 @@ function Reports({ user }) {
     }
 
     // ============================================
-    // 1. SINCRONIZAR VENDAS PENDENTES ANTES DE FECHAR
+    // 1. SINCRONIZAR VENDAS PENDENTES (com timeout)
     // ============================================
     setClosureError("Sincronizando vendas pendentes...");
     try {
-      const syncResult = await syncPendingSalesQueue();
-      console.log(`[confirmCloseCash] Sincronização: ${syncResult.synced} sincronizadas, ${syncResult.errors} com erro`);
+      // Timeout de 5 segundos para não travar
+      const syncPromise = syncPendingSalesQueue();
+      const timeoutPromise = new Promise((_, reject) => 
+        setTimeout(() => reject(new Error('Timeout')), 5000)
+      );
+      
+      const syncResult = await Promise.race([syncPromise, timeoutPromise]);
+      console.log(`[confirmCloseCash] Sincronização: ${syncResult?.synced || 0} sincronizadas, ${syncResult?.errors || 0} com erro`);
     } catch (error) {
-      console.error('[confirmCloseCash] Erro ao sincronizar vendas pendentes:', error);
+      console.warn('[confirmCloseCash] Sincronização ignorada (timeout ou erro):', error.message);
       // Continuar mesmo se houver erro na sincronização
     }
+    
+    setClosureError("Gerando relatório...");
 
     // Obter caixa atual do localStorage
     const cash = JSON.parse(localStorage.getItem('currentCashRegister') || 'null');
     if (!cash) {
       alert('Erro: Nenhum caixa aberto encontrado.');
+      setClosureError("");
       return;
     }
 
-    // ============================================
-    // BUSCAR VENDAS DO SUPABASE + LOCALSTORAGE
-    // ============================================
     const today = new Date();
-    let salesOfCurrentCash = [];
-    let cancelledOfCurrentCash = [];
     
-    try {
-      const storeId = resolveStoreId();
-      const startOfDay = new Date(today.setHours(0, 0, 0, 0)).toISOString();
-      const endOfDay = new Date(today.setHours(23, 59, 59, 999)).toISOString();
-      
-      console.log('[confirmCloseCash] Buscando vendas do Supabase...');
-      console.log('[confirmCloseCash] Store ID:', storeId);
-      console.log('[confirmCloseCash] Período:', startOfDay, 'até', endOfDay);
-      
-      // Buscar vendas do dia do Supabase
-      const { data: supabaseSales, error } = await supabase
-        .from('sales')
-        .select('*')
-        .eq('store_id', storeId)
-        .gte('created_at', startOfDay)
-        .lte('created_at', endOfDay)
-        .order('created_at', { ascending: false });
-      
-      if (error) {
-        console.error('[confirmCloseCash] Erro ao buscar vendas do Supabase:', error);
-      } else {
-        console.log('[confirmCloseCash] Vendas encontradas no Supabase:', supabaseSales?.length || 0);
-        
-        // Separar vendas normais e canceladas
-        salesOfCurrentCash = supabaseSales.filter(s => 
-          s.status !== 'cancelled' && s.status !== 'canceled'
-        ) || [];
-        
-        cancelledOfCurrentCash = supabaseSales.filter(s => 
-          s.status === 'cancelled' || s.status === 'canceled'
-        ) || [];
-        
-        console.log('[confirmCloseCash] Vendas ativas:', salesOfCurrentCash.length);
-        console.log('[confirmCloseCash] Vendas canceladas:', cancelledOfCurrentCash.length);
-      }
-    } catch (error) {
-      console.error('[confirmCloseCash] Erro ao buscar vendas:', error);
-      
-      // Fallback: buscar do localStorage se houver erro no Supabase
-      console.log('[confirmCloseCash] Usando fallback do localStorage...');
-      const allSales = JSON.parse(localStorage.getItem('sales') || '[]');
-      salesOfCurrentCash = allSales.filter(s => 
-        s.cashRegisterId === cash.id && 
-        s.status !== 'cancelled' && 
-        s.status !== 'canceled'
-      );
-      cancelledOfCurrentCash = allSales.filter(
-        s => (s.status === 'cancelled' || s.status === 'canceled') && s.cashRegisterId === cash.id
-      );
-    }
-
-    // Calcular totais apenas com vendas do caixa atual
-    const paymentMethods = {};
-    let totalSales = 0;
-    let totalDiscounts = 0;
-    let totalCosts = 0;
-
-    // Buscar produtos do Supabase para cálculo de custos
-    let productsMap = {};
-    try {
-      const storeId = resolveStoreId();
-      const { data: supabaseProducts } = await supabase
-        .from('products')
-        .select('id, cost_price, costPrice')
-        .eq('store_id', storeId);
-      
-      if (supabaseProducts) {
-        supabaseProducts.forEach(p => {
-          productsMap[p.id] = p.cost_price || p.costPrice || 0;
-        });
-        console.log('[confirmCloseCash] ✅ Produtos carregados:', Object.keys(productsMap).length);
-        console.log('[confirmCloseCash] 📦 Mapa de Produtos:', productsMap);
-      }
-    } catch (error) {
-      console.error('[confirmCloseCash] Erro ao buscar produtos:', error);
-      // Fallback para localStorage
-      const localProducts = db.products.list();
-      localProducts.forEach(p => {
-        productsMap[p.id] = p.cost_price || p.costPrice || 0;
-      });
-      console.log('[confirmCloseCash] ⚠️ Usando fallback localStorage, produtos:', Object.keys(productsMap).length);
-    }
-
-    salesOfCurrentCash.forEach(sale => {
-      const method = sale.payment_method || 'money';
-      if (!paymentMethods[method]) {
-        paymentMethods[method] = 0;
-      }
-      
-      const saleAmount = sale.total_amount || sale.totalAmount || 0;
-      paymentMethods[method] += saleAmount;
-      totalSales += saleAmount;
-      totalDiscounts += sale.discount || 0;
-
-      // Calcular custos dos itens vendidos
-      const items = sale.items || [];
-      console.log(`[confirmCloseCash] 🧾 Venda ${sale.id}: ${items.length} itens`);
-      items.forEach(item => {
-        const costPrice = productsMap[item.product_id] || 0;
-        const itemCost = costPrice * item.quantity;
-        console.log(`[confirmCloseCash]   - Produto ${item.product_id}: custo unitário R$ ${costPrice}, qtd ${item.quantity}, subtotal R$ ${itemCost}`);
-        totalCosts += itemCost;
-      });
-    });
-    console.log(`[confirmCloseCash] 💰 Total de Custos Calculado: R$ ${totalCosts}`);
-
-    // Descontar cancelamentos
-    cancelledOfCurrentCash.forEach(sale => {
-      const saleAmount = sale.total_amount || sale.totalAmount || 0;
-      totalSales -= saleAmount;
-      const method = sale.payment_method || 'money';
-      if (paymentMethods[method]) {
-        paymentMethods[method] -= saleAmount;
-      }
+    // Usar os dados que já foram calculados em handleCloseCash
+    const salesOfCurrentCash = closureData?.sales || [];
+    const cancelledOfCurrentCash = closureData?.cancelled || [];
+    const paymentMethods = closureData?.paymentMethods || {};
+    const totalSales = closureData?.totalSales || 0;
+    const totalDiscounts = closureData?.totalDiscounts || 0;
+    const totalCosts = closureData?.totalCosts || 0;
+    const totalExpenses = closureData?.totalExpenses || 0;
+    const grossProfit = closureData?.grossProfit || 0;
+    const finalCashAmount = closureData?.finalCashAmount || 0;
+    const dayExpenses = closureData?.expenses || [];
+    
+    console.log('[confirmCloseCash] Dados do fechamento:', {
+      vendas: salesOfCurrentCash.length,
+      totalSales,
+      totalCosts,
+      grossProfit
     });
 
-    // Calcular despesas do dia do Supabase
-    let dayExpenses = [];
-    try {
-      const storeId = resolveStoreId();
-      const startOfDay = new Date(today.setHours(0, 0, 0, 0)).toISOString();
-      const endOfDay = new Date(today.setHours(23, 59, 59, 999)).toISOString();
-      
-      const { data: supabaseExpenses, error } = await supabase
-        .from('expenses')
-        .select('*')
-        .eq('store_id', storeId)
-        .gte('date', startOfDay)
-        .lte('date', endOfDay);
-      
-      if (error) {
-        console.error('[confirmCloseCash] Erro ao buscar despesas:', error);
-        // Fallback para localStorage
-        const allExpenses = db.expenses.list();
-        dayExpenses = allExpenses.filter(expense => {
-          const expenseDate = new Date(expense.date);
-          return expenseDate.toISOString().split('T')[0] === today.toISOString().split('T')[0];
-        });
-      } else {
-        dayExpenses = supabaseExpenses || [];
-        console.log('[confirmCloseCash] Despesas encontradas:', dayExpenses.length);
-      }
-    } catch (error) {
-      console.error('[confirmCloseCash] Erro ao buscar despesas:', error);
-      const allExpenses = db.expenses.list();
-      dayExpenses = allExpenses.filter(expense => {
-        const expenseDate = new Date(expense.date);
-        return expenseDate.toISOString().split('T')[0] === today.toISOString().split('T')[0];
-      });
-    }
-    
-    const totalExpenses = dayExpenses.reduce((sum, e) => sum + (e.amount || 0), 0);
-
-    // Lucro Bruto: Vendas - Abertura - Custos
-    const grossProfit = totalSales - cash.openingValue - totalCosts;
-
-    // Valor final no caixa = Abertura + Vendas - Custos
-    const finalCashAmount = cash.openingValue + totalSales - totalCosts;
-
-    // ============================================
-    // 2. GERAR RESUMO
-    // ============================================
-    const totals = {
+    // Dados para o PDF
+    const pdfData = {
+      date: today.toISOString(),
+      sales: salesOfCurrentCash,
+      cancelled: cancelledOfCurrentCash,
+      cashRegisterId: cash.id,
+      openingAmount: cash.openingValue || 0,
       totalSales,
       totalCosts,
       totalExpenses,
       totalDiscounts,
       grossProfit,
-      paymentMethods,
-      openingAmount: cash.openingValue,
       finalCashAmount,
-      salesCount: salesOfCurrentCash.length,
-      cancelledCount: cancelledOfCurrentCash.length,
-      expensesCount: dayExpenses.length,
-    };
-
-    // Criar relatório local
-    const report = {
-      id: Date.now(),
-      cashRegisterId: cash.id,
-      openingValue: cash.openingValue,
-      openedAt: cash.openedAt,
-      closedAt: new Date().toISOString(),
-      sales: salesOfCurrentCash,
-      cancelled: cancelledOfCurrentCash,
-      ...totals,
-      created_by: user?.name || user?.email || 'Sistema',
-      date: today.toISOString()
-    };
-
-    // Salvar relatório no localStorage
-    const existingReports = JSON.parse(localStorage.getItem('reports') || '[]');
-    localStorage.setItem('reports', JSON.stringify([...existingReports, report]));
-
-    // Salvar também no banco local para compatibilidade
-    const closureData = {
-      date: today.toISOString(),
-      sales: salesOfCurrentCash,
-      cancelled: cancelledOfCurrentCash,
-      cashRegisterId: cash.id,
-      // Adicionar todos os campos com os nomes corretos que o PDF espera
-      openingAmount: cash.openingValue,
-      totalSales: totalSales,
-      totalCosts: totalCosts,
-      totalExpenses: totalExpenses,
-      totalDiscounts: totalDiscounts,
-      grossProfit: grossProfit,
-      finalCashAmount: finalCashAmount,
-      paymentMethods: paymentMethods,
+      paymentMethods,
       salesCount: salesOfCurrentCash.length,
       cancelledCount: cancelledOfCurrentCash.length,
       expensesCount: dayExpenses.length,
@@ -7985,194 +7797,52 @@ function Reports({ user }) {
       created_by: user?.name || user?.email || 'Sistema',
       created_at: today.toISOString()
     };
-    // ============================================
-    // 3. GERAR PDF
-    // ============================================
-    setClosureError("Gerando PDF do fechamento...");
-    let pdfPath = null;
-    
+
+    // Gerar PDF
     try {
-      // Gerar PDF usando a função existente (gera e imprime)
-      generateClosurePDF(closureData);
-      
-      // Criar nome do arquivo para referência
-      const closureDate = format(today, "dd-MM-yyyy");
-      const closureTime = format(today, "HH-mm");
-      const managerName = (user?.name || user?.email || 'Sistema').replace(/[^a-z0-9]/gi, '_');
-      const fileName = `fechamento_${closureDate}_${closureTime}_${managerName}.pdf`;
-      
-      // Definir caminho para referência (em produção, fazer upload real do PDF gerado)
-      pdfPath = `closures/${fileName}`;
-      
-      console.log('[confirmCloseCash] PDF gerado:', pdfPath);
-      
-      // TODO: Em produção, capturar o PDF gerado e fazer upload real
-      // Por enquanto, apenas registrar o caminho
+      generateClosurePDF(pdfData);
+      console.log('[confirmCloseCash] ✅ PDF gerado');
     } catch (error) {
       console.error('[confirmCloseCash] Erro ao gerar PDF:', error);
-      // Continuar mesmo se houver erro ao gerar PDF
     }
 
-    // ============================================
-    // 4. UPLOAD PARA SUPABASE STORAGE (OPCIONAL)
-    // ============================================
-    // Nota: O upload real do PDF requer captura do arquivo gerado
-    // Por enquanto, apenas registramos o caminho esperado
-    if (pdfPath) {
-      setClosureError("Preparando upload do PDF...");
-      
-      try {
-        const storeId = resolveStoreId();
-        
-        // TODO: Em produção, fazer upload real do PDF
-        // Por enquanto, apenas registrar o caminho
-        console.log('[confirmCloseCash] Caminho do PDF para upload:', pdfPath);
-        
-        // Exemplo de como seria o upload (comentado até implementar captura do PDF):
-        /*
-        const pdfBlob = await capturePDF(); // Função a ser implementada
-        const { data: uploadData, error: uploadError } = await supabase.storage
-          .from('closures')
-          .upload(pdfPath, pdfBlob, {
-            contentType: 'application/pdf',
-            upsert: true
-          });
-        
-        if (uploadError) {
-          console.warn('[confirmCloseCash] Erro ao fazer upload do PDF:', uploadError);
-        } else {
-          pdfPath = uploadData.path;
-        }
-        */
-      } catch (error) {
-        console.error('[confirmCloseCash] Erro ao preparar upload do PDF:', error);
-        // Continuar mesmo se houver erro
-      }
-    }
-
-    // ============================================
-    // 5. INSERIR REGISTRO NA TABELA closures
-    // ============================================
-    setClosureError("Salvando fechamento no servidor...");
+    // Salvar no localStorage
+    const report = {
+      id: Date.now(),
+      ...pdfData,
+      openedAt: cash.openedAt,
+      closedAt: today.toISOString()
+    };
     
-    try {
-      const storeId = resolveStoreId();
-      
-      // Buscar cash_session_id do Supabase
-      let cashSessionId = null;
-      try {
-        const { data: session } = await supabase
-          .from('cash_sessions')
-          .select('id')
-          .eq('store_id', storeId)
-          .eq('status', 'open')
-          .maybeSingle();
-        
-        cashSessionId = session?.id || null;
-      } catch (e) {
-        console.warn('[confirmCloseCash] Erro ao buscar cash_session_id:', e);
-      }
-      
-      const closurePayload = {
-        date: today.toISOString(),
-        cash_session_id: cashSessionId || cash.id?.toString?.(),
-        cashSessionId: cashSessionId || cash.id?.toString?.(),
-        cashRegisterId: cash.id,
-        openingAmount: cash.openingValue || 0,
-        totalSales: totalSales || 0,
-        totalCosts: totalCosts || 0,
-        totalExpenses: totalExpenses || 0,
-        totalDiscounts: totalDiscounts || 0,
-        grossProfit: grossProfit || 0,
-        finalCashAmount: finalCashAmount || 0,
-        paymentMethods: paymentMethods || {},
-        sales: salesOfCurrentCash || [],
-        cancelled: cancelledOfCurrentCash || [],
-        expenses: dayExpenses || [],
-        salesCount: salesOfCurrentCash.length || 0,
-        cancelledCount: cancelledOfCurrentCash.length || 0,
-        expensesCount: dayExpenses.length || 0,
-        totals: totals,
-        pdfPath: pdfPath,
-      };
+    const existingReports = JSON.parse(localStorage.getItem('reports') || '[]');
+    localStorage.setItem('reports', JSON.stringify([...existingReports, report]));
+    console.log('[confirmCloseCash] ✅ Relatório salvo no localStorage');
 
-      const { supabaseDB } = await import('./services/supabaseDB.js');
-      const closureRecord = await supabaseDB.closures.create(closurePayload, user);
-      
-      console.log('[confirmCloseCash] ✅ Fechamento salvo no Supabase com TODOS os dados!');
-      console.log('[confirmCloseCash] 📊 Resumo do fechamento:');
-      console.log('[confirmCloseCash] - ID:', closureRecord.id);
-      console.log('[confirmCloseCash] - Data:', closureRecord.date);
-      console.log('[confirmCloseCash] - Abertura: R$', closureRecord.opening_amount);
-      console.log('[confirmCloseCash] - Total Vendas: R$', closureRecord.total_sales);
-      console.log('[confirmCloseCash] - Total Custos: R$', closureRecord.total_costs);
-      console.log('[confirmCloseCash] - Total Despesas: R$', closureRecord.total_expenses);
-      console.log('[confirmCloseCash] - Descontos: R$', closureRecord.total_discounts);
-      console.log('[confirmCloseCash] - Lucro Bruto: R$', closureRecord.gross_profit);
-      console.log('[confirmCloseCash] - Valor Final: R$', closureRecord.final_cash_amount);
-      console.log('[confirmCloseCash] - Vendas Realizadas:', closureRecord.sales_count);
-      console.log('[confirmCloseCash] - Vendas Canceladas:', closureRecord.cancelled_count);
-      console.log('[confirmCloseCash] - Despesas Registradas:', closureRecord.expenses_count);
-      console.log('[confirmCloseCash] - Métodos de pagamento:', Object.keys(closureRecord.payment_methods || {}));
-    } catch (error) {
-      console.error('[confirmCloseCash] Erro ao inserir fechamento:', error);
-      try {
-        // Fallback local para não perder o fechamento
-        db.closures.create({
-          date: today.toISOString(),
-          sales: salesOfCurrentCash,
-          cancelled: cancelledOfCurrentCash,
-          expenses: dayExpenses,
-          openingAmount: cash.openingValue || 0,
-          totalSales: totalSales || 0,
-          totalCosts: totalCosts || 0,
-          totalExpenses: totalExpenses || 0,
-          totalDiscounts: totalDiscounts || 0,
-          grossProfit: grossProfit || 0,
-          finalCashAmount: finalCashAmount || 0,
-          paymentMethods: paymentMethods || {},
-          salesCount: salesOfCurrentCash.length || 0,
-          cancelledCount: cancelledOfCurrentCash.length || 0,
-          expensesCount: dayExpenses.length || 0,
-          totals: totals,
-          pdfPath: pdfPath,
-          cashRegisterId: cash.id,
-        }, user);
-        console.warn('[confirmCloseCash] Fechamento salvo localmente (fallback).');
-      } catch (fallbackError) {
-        console.error('[confirmCloseCash] Falhou também o fallback local:', fallbackError);
-      }
-      // Continuar mesmo se houver erro
-    }
-
-    // ============================================
-    // 6. LIMPAR SESSÃO DE CAIXA LOCAL
-    // ============================================
+    // Limpar caixa
     localStorage.removeItem('currentCashRegister');
     setCurrentCashOpening(null);
     
-    // Fechar o modal
+    // Limpar modal
     setShowPasswordModal(false);
     setClosurePassword("");
     setClosureError("");
     setClosureData(null);
-
-    // Atualizar vendas (vai limpar a lista já que não há caixa aberto)
+    
+    // Atualizar vendas (vai mostrar vazio pois caixa fechou)
     refreshSales();
     
-    // Mostrar mensagem de sucesso
-    alert(`Caixa fechado com sucesso!\n\nValor Final: ${formatCurrency(finalCashAmount)}\nTotal de Vendas: ${formatCurrency(totalSales)}\nLucro: ${formatCurrency(grossProfit)}\n\nO relatório foi salvo e sincronizado.`);
+    alert('✅ Caixa fechado com sucesso!');
   };
 
   // Exportar fechamento
-  const exportClosure = (closure) => {
+  const exportClosure = async (closure) => {
     const closureDate = closure.date ? format(new Date(closure.date), "dd/MM/yyyy") : format(new Date(), "dd/MM/yyyy");
     const closureTime = format(new Date(closure.created_at || new Date()), "HH:mm");
     // Preferir nome resolvido (vindo do SBD) e depois fallback para usuários locais
     let managerName = closure.created_by_name || closure.created_by || 'Sistema';
     try {
       if (!closure.created_by_name) {
-        const usersList = db.users.list() || [];
+        const usersList = await db.users.list() || [];
         const found = usersList.find(u => u.id === closure.created_by || u.email === closure.created_by || u.tenantId === closure.created_by || u.store_id === closure.created_by || u.storeId === closure.created_by);
         if (found && found.name) managerName = found.name;
       }
@@ -8332,7 +8002,14 @@ function Reports({ user }) {
 
       {tab === "finalized" && (
         <div>
-          {finalizedSales.length === 0 ? (
+          {/* Se o caixa estiver fechado, mostrar mensagem */}
+          {!currentCashOpening || currentCashOpening.closed ? (
+            <Card className="p-8 text-center rounded-xl bg-gray-50">
+              <DollarSign size={48} className="mx-auto mb-4 text-gray-400" />
+              <p className="text-gray-500 text-lg font-medium">Caixa fechado</p>
+              <p className="text-gray-400 text-sm mt-2">Abra o caixa para visualizar as vendas</p>
+            </Card>
+          ) : finalizedSales.length === 0 ? (
             <Card className="p-8 text-center rounded-xl">
               <p className="text-gray-500">Nenhuma venda finalizada ainda</p>
             </Card>
@@ -8360,7 +8037,14 @@ function Reports({ user }) {
 
       {tab === "cancelled" && (
         <div>
-          {cancelledSales.length === 0 ? (
+          {/* Se o caixa estiver fechado, mostrar mensagem */}
+          {!currentCashOpening || currentCashOpening.closed ? (
+            <Card className="p-8 text-center rounded-xl bg-gray-50">
+              <DollarSign size={48} className="mx-auto mb-4 text-gray-400" />
+              <p className="text-gray-500 text-lg font-medium">Caixa fechado</p>
+              <p className="text-gray-400 text-sm mt-2">Abra o caixa para visualizar as vendas canceladas</p>
+            </Card>
+          ) : cancelledSales.length === 0 ? (
             <Card className="p-8 text-center rounded-xl">
               <p className="text-gray-500">Nenhuma venda cancelada</p>
             </Card>
@@ -8887,8 +8571,7 @@ function Reports({ user }) {
                 Cancelar
               </Button>
               <Button
-                variant="danger"
-                className="flex-1 rounded-full"
+                className="flex-1 rounded-full bg-amber-500 text-black hover:bg-red-600 hover:text-white transition-colors"
                 onClick={confirmCancel}
               >
                 Confirmar Cancelamento
@@ -9620,32 +9303,35 @@ export default function App() {
   
   // Carregar usuário do localStorage ao iniciar (persistência de sessão)
   useEffect(() => {
-    try {
-      const savedUser = localStorage.getItem('mozyc_pdv_current_user');
-      if (savedUser) {
-        const user = JSON.parse(savedUser);
-        // Validar se o usuário ainda existe no banco
-        const allUsers = db.users.list();
-        const validUser = allUsers.find(u => 
-          (u.id === user.id) || 
-          (u.email && user.email && u.email === user.email) ||
-          (u.cpf && user.cpf && u.cpf === user.cpf)
-        );
-        if (validUser && validUser.active !== false) {
-          // Atualizar dados do usuário
-          Object.assign(validUser, {
-            tenantId: user.tenantId || (validUser.role === 'admin' && validUser.email 
-              ? validUser.email.toLowerCase().replace(/[^a-z0-9]/g, '_')
-              : user.tenantId || 'default')
-          });
-          setCurrentUser(validUser);
-        } else {
-          localStorage.removeItem('mozyc_pdv_current_user');
+    const validateUser = async () => {
+      try {
+        const savedUser = localStorage.getItem('mozyc_pdv_current_user');
+        if (savedUser) {
+          const user = JSON.parse(savedUser);
+          // Validar se o usuário ainda existe no banco
+          const allUsers = await db.users.list() || [];
+          const validUser = allUsers.find(u => 
+            (u.id === user.id) || 
+            (u.email && user.email && u.email === user.email) ||
+            (u.cpf && user.cpf && u.cpf === user.cpf)
+          );
+          if (validUser && validUser.active !== false) {
+            // Atualizar dados do usuário
+            Object.assign(validUser, {
+              tenantId: user.tenantId || (validUser.role === 'admin' && validUser.email 
+                ? validUser.email.toLowerCase().replace(/[^a-z0-9]/g, '_')
+                : user.tenantId || 'default')
+            });
+            setCurrentUser(validUser);
+          } else {
+            localStorage.removeItem('mozyc_pdv_current_user');
+          }
         }
+      } catch (e) {
+        // Erro ao carregar, ignora
       }
-    } catch (e) {
-      // Erro ao carregar, ignora
-    }
+    };
+    validateUser();
   }, []);
 
   // Verificar periodicamente se o usuário foi desativado (apenas para usuários do Supabase)
@@ -9701,7 +9387,7 @@ export default function App() {
   }, [currentUser]);
 
   // Função para lidar com login
-  const handleLogin = (user) => {
+  const handleLogin = async (user) => {
     if (user) {
       if (!user.role) {
         user.role = 'caixa';
@@ -9711,7 +9397,7 @@ export default function App() {
         if (user.role === 'admin' && user.email) {
           user.tenantId = user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
         } else {
-          const allUsers = db.users.list();
+          const allUsers = await db.users.list() || [];
           const admin = allUsers.find(u => u.role === 'admin');
           user.tenantId = admin && admin.email 
             ? admin.email.toLowerCase().replace(/[^a-z0-9]/g, '_')

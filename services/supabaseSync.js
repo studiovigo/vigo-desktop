@@ -17,24 +17,10 @@ import { isUsingSQLite, executeQuery, fetchQuery } from './database';
  * NUNCA retorna null - sempre retorna um valor válido
  */
 export function resolveStoreId(currentUser = null) {
-  // Se currentUser foi passado, usar diretamente
+  // Usar apenas Supabase: store_id do usuário logado
   if (currentUser?.store_id) return currentUser.store_id;
-  if (currentUser?.tenantId) return currentUser.tenantId;
-  
-  // Tentar buscar do localStorage
-  try {
-    const userStr = localStorage.getItem('mozyc_pdv_current_user');
-    if (userStr) {
-      const user = JSON.parse(userStr);
-      if (user.store_id) return user.store_id;
-      if (user.tenantId) return user.tenantId;
-    }
-  } catch (e) {
-    console.error('[supabaseSync] Erro ao ler localStorage:', e);
-  }
-  
-  // Fallback final - NUNCA retorna null
-  return 'default_store';
+  // Se não houver store_id, retorna null (caller deve tratar)
+  return null;
 }
 
 // Variável global para log único (evita spam no console)
@@ -112,22 +98,26 @@ function fromSupabaseFormat(product) {
 
 /**
  * Sincroniza produtos do localStorage para Supabase
+ * @param {Object} currentUser - Usuário autenticado do Supabase
+ * @param {Object} dbModule - Módulo de banco local (db.js)
  */
-export async function pushProducts() {
+export async function pushProducts(currentUser, dbModule) {
   try {
-    const currentUser = JSON.parse(localStorage.getItem('mozyc_pdv_current_user') || '{}');
-    const storeId = getStoreIdWithWarning(currentUser);
-    
-    // Buscar produtos do localStorage (tentar diferentes chaves)
-    let localProducts = [];
-    try {
-      const tenantId = currentUser.tenantId || currentUser.email?.toLowerCase().replace(/[^a-z0-9]/g, '_') || 'default';
-      const dbKey = `mozyc_pdv_db_v2_tenant_${tenantId}`;
-      const dbData = JSON.parse(localStorage.getItem(dbKey) || localStorage.getItem('mozyc_pdv_db_v2') || '{}');
-      localProducts = dbData.products || [];
-    } catch (e) {
-      console.warn('[supabaseSync] Erro ao ler produtos do localStorage:', e);
+    if (!currentUser?.id) {
+      throw new Error('pushProducts: currentUser required with id');
     }
+    if (!dbModule?.getDB) {
+      throw new Error('pushProducts: dbModule required with getDB method');
+    }
+    
+    const storeId = resolveStoreId(currentUser);
+    if (!storeId) {
+      throw new Error('pushProducts: Unable to resolve storeId. User not authenticated.');
+    }
+    
+    // Buscar produtos do banco local
+    const db = dbModule.getDB();
+    const localProducts = db.products || [];
     
     if (localProducts.length === 0) {
       console.log('[supabaseSync] Nenhum produto local para sincronizar');
@@ -143,7 +133,7 @@ export async function pushProducts() {
       };
     });
     
-    // Upsert no Supabase (insere ou atualiza)
+    // Upsert no Supabase
     const { data, error } = await supabase
       .from('products')
       .upsert(productsToSync, { onConflict: 'id' })
@@ -164,11 +154,22 @@ export async function pushProducts() {
 
 /**
  * Sincroniza produtos do Supabase para localStorage
+ * @param {Object} currentUser - Usuário autenticado do Supabase
+ * @param {Object} dbModule - Módulo de banco local (db.js)
  */
-export async function pullProducts() {
+export async function pullProducts(currentUser, dbModule) {
   try {
-    const currentUser = JSON.parse(localStorage.getItem('mozyc_pdv_current_user') || '{}');
-    const storeId = getStoreIdWithWarning(currentUser);
+    if (!currentUser?.id) {
+      throw new Error('pullProducts: currentUser required with id');
+    }
+    if (!dbModule?.saveDB) {
+      throw new Error('pullProducts: dbModule required with saveDB method');
+    }
+    
+    const storeId = resolveStoreId(currentUser);
+    if (!storeId) {
+      throw new Error('pullProducts: Unable to resolve storeId. User not authenticated.');
+    }
     
     // Buscar produtos do Supabase
     const { data, error } = await supabase
@@ -189,16 +190,10 @@ export async function pullProducts() {
     // Converter para formato local
     const localProducts = data.map(fromSupabaseFormat);
     
-    // Salvar no localStorage
-    try {
-      const tenantId = currentUser.tenantId || currentUser.email?.toLowerCase().replace(/[^a-z0-9]/g, '_') || 'default';
-      const dbKey = `mozyc_pdv_db_v2_tenant_${tenantId}`;
-      const dbData = JSON.parse(localStorage.getItem(dbKey) || '{}');
-      dbData.products = localProducts;
-      localStorage.setItem(dbKey, JSON.stringify(dbData));
-    } catch (e) {
-      console.error('[supabaseSync] Erro ao salvar produtos no localStorage:', e);
-    }
+    // Salvar no banco local
+    const db = dbModule.getDB();
+    db.products = localProducts;
+    dbModule.saveDB(db);
     
     console.log(`[supabaseSync] ✅ ${localProducts.length} produtos baixados`);
     return { success: true, synced: localProducts.length };
@@ -210,14 +205,26 @@ export async function pullProducts() {
 
 /**
  * Sincroniza vendas do localStorage para Supabase
+ * @param {Object} currentUser - Usuário autenticado do Supabase
+ * @param {Object} dbModule - Módulo de banco local (db.js)
  */
-export async function pushSales() {
+export async function pushSales(currentUser, dbModule) {
   try {
-    const currentUser = JSON.parse(localStorage.getItem('mozyc_pdv_current_user') || '{}');
-    const storeId = getStoreIdWithWarning(currentUser);
+    if (!currentUser?.id) {
+      throw new Error('pushSales: currentUser required with id');
+    }
+    if (!dbModule?.getDB) {
+      throw new Error('pushSales: dbModule required with getDB method');
+    }
     
-    // Buscar vendas do localStorage
-    const localSales = JSON.parse(localStorage.getItem('sales') || '[]');
+    const storeId = resolveStoreId(currentUser);
+    if (!storeId) {
+      throw new Error('pushSales: Unable to resolve storeId. User not authenticated.');
+    }
+    
+    // Buscar vendas do banco local
+    const db = dbModule.getDB();
+    const localSales = db.sales || [];
     
     if (localSales.length === 0) {
       console.log('[supabaseSync] Nenhuma venda local para sincronizar');
@@ -227,7 +234,7 @@ export async function pushSales() {
     // Preparar vendas para Supabase
     const salesToSync = localSales.map(sale => ({
       id: sale.id,
-      store_id: storeId, // Garantir store_id sempre presente
+      store_id: storeId,
       user_id: sale.user_id || currentUser.id,
       cash_session_id: sale.cash_session_id || sale.cashRegisterId,
       items: sale.items || [],

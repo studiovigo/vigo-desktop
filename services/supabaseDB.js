@@ -8,12 +8,79 @@ import { supabase } from './supabaseClient';
  * Permite migração gradual sem quebrar código existente
  */
 
-// Helper para obter store_id do usuário atual com fallback seguro
-// Usa resolveStoreId do supabaseSync para garantir sempre um valor válido
-import { resolveStoreId } from './supabaseSync';
+// ⚡ Cache em memória para store_id (evita queries repetidas)
+const STORE_ID_CACHE = {
+  value: null,
+  timestamp: 0,
+  TTL: 10 * 60 * 1000, // 10 minutos (aumentado para menos queries)
+  isValid() {
+    return this.value && this.value !== 'default_store' && (Date.now() - this.timestamp < this.TTL);
+  },
+  set(val) {
+    if (val && val !== 'default_store') {
+      this.value = val;
+      this.timestamp = Date.now();
+    }
+  },
+  clear() {
+    this.value = null;
+    this.timestamp = 0;
+  }
+};
 
-const getCurrentStoreId = () => {
-  return resolveStoreId(); // Sempre retorna um valor válido (nunca null)
+// Helper para obter store_id do usuário atual (apenas Supabase)
+// ⚡ OTIMIZADO: Usa cache primeiro, depois localStorage, depois Supabase
+async function getCurrentStoreId() {
+  // 1. Verificar cache primeiro (mais rápido)
+  if (STORE_ID_CACHE.isValid()) {
+    return STORE_ID_CACHE.value;
+  }
+  
+  // 2. Tentar localStorage (rápido, não faz query)
+  try {
+    const localUser = localStorage.getItem('mozyc_pdv_current_user');
+    if (localUser) {
+      const parsed = JSON.parse(localUser);
+      if (parsed.store_id && parsed.store_id !== 'default_store') {
+        STORE_ID_CACHE.set(parsed.store_id);
+        return parsed.store_id;
+      }
+    }
+  } catch (e) {
+    // ignore parse error
+  }
+  
+  // 3. Tentar Supabase Auth (mais lento)
+  try {
+    const { data: { user } } = await supabase.auth.getUser();
+    if (user?.user_metadata?.store_id && user.user_metadata.store_id !== 'default_store') {
+      STORE_ID_CACHE.set(user.user_metadata.store_id);
+      return user.user_metadata.store_id;
+    }
+    if (user?.store_id && user.store_id !== 'default_store') {
+      STORE_ID_CACHE.set(user.store_id);
+      return user.store_id;
+    }
+  } catch (e) {
+    console.error('[supabaseDB] Erro ao obter store_id do usuário logado:', e);
+  }
+  
+  // 4. Fallback: busca do primeiro produto existente
+  try {
+    const { data, error } = await supabase
+      .from('products')
+      .select('store_id')
+      .limit(1)
+      .maybeSingle();
+    if (data && data.store_id && data.store_id !== 'default_store') {
+      STORE_ID_CACHE.set(data.store_id);
+      return data.store_id;
+    }
+  } catch (e) {
+    console.error('[supabaseDB] Erro ao buscar store_id do primeiro produto:', e);
+  }
+  
+  return null; // NUNCA retornar 'default_store'
 };
 
 // Helper para obter user_id do usuário atual
@@ -28,24 +95,65 @@ const getCurrentUserId = async () => {
 };
 
 // Helper para recuperar store_id real quando está como 'default_store'
-const getActualStoreId = async () => {
-  let storeId = getCurrentStoreId();
-  
-  // Se storeId é default_store, tentar recuperar o real
-  if (storeId === 'default_store') {
-    console.log('[supabaseDB] Tentando recuperar store_id real...');
-    const { data: allProducts, error } = await supabase
-      .from('products')
-      .select('store_id')
-      .limit(1);
-    
-    if (!error && allProducts && allProducts.length > 0) {
-      storeId = allProducts[0].store_id;
-      console.log('[supabaseDB] Store_id recuperado:', storeId);
-    }
+// ⚡ Otimizado: Usa cache em memória para evitar queries repetidas
+async function getActualStoreId() {
+  // 1. Verificar cache primeiro (mais rápido)
+  if (STORE_ID_CACHE.isValid()) {
+    return STORE_ID_CACHE.value;
   }
   
-  return storeId;
+  // 2. Tentar getCurrentStoreId
+  let storeId = await getCurrentStoreId();
+  if (storeId) {
+    STORE_ID_CACHE.set(storeId);
+    return storeId;
+  }
+  
+  // 3. Fallback: buscar store_id de um produto existente
+  const { data: allProducts } = await supabase
+    .from('products')
+    .select('store_id')
+    .not('store_id', 'is', null)
+    .limit(1);
+  
+  if (allProducts && allProducts.length > 0 && allProducts[0].store_id) {
+    storeId = allProducts[0].store_id;
+    STORE_ID_CACHE.set(storeId);
+    return storeId;
+  }
+  
+  // 4. Último recurso: retornar null e deixar query sem filtro de store_id
+  return null;
+}
+
+// Helper para construir query com store_id seguro
+// Se storeId for null, não adiciona o filtro (evita erro de UUID inválido)
+function addStoreIdFilter(query, storeId) {
+  if (storeId && storeId !== 'default_store') {
+    return query.eq('store_id', storeId);
+  }
+  return query; // Retorna query sem filtro de store_id
+}
+
+// Cache de produtos para evitar múltiplas queries
+const PRODUCTS_CACHE = {
+  data: null,
+  timestamp: 0,
+  TTL: 2 * 60 * 1000, // 2 minutos
+  isValid() {
+    return this.data && (Date.now() - this.timestamp < this.TTL);
+  },
+  set(products) {
+    this.data = products;
+    this.timestamp = Date.now();
+  },
+  clear() {
+    this.data = null;
+    this.timestamp = 0;
+  },
+  get() {
+    return this.data;
+  }
 };
 
 export const supabaseDB = {
@@ -54,83 +162,86 @@ export const supabaseDB = {
   // ============================================
   products: {
     list: async () => {
-      let storeId = getCurrentStoreId();
-      console.log('[supabaseDB.products.list] Buscando produtos com store_id:', storeId);
-      
-      // Se storeId é default_store, recuperar o real
-      if (storeId === 'default_store') {
-        storeId = await getActualStoreId();
+      // Se temos cache válido, retornar imediatamente
+      if (PRODUCTS_CACHE.isValid()) {
+        return PRODUCTS_CACHE.data;
       }
       
-      const { data, error } = await supabase
-        .from('products')
-        .select('*')
-        .eq('store_id', storeId)
-        .order('name', { ascending: true });
+      const storeId = await getCurrentStoreId();
       
-      if (error) {
-        console.error('[supabaseDB.products.list] Erro ao listar produtos:', error);
-        return [];
-      }
-      
-      // Debug: Se não encontrou produtos e não é default_store, tentar listar TODOS para ver quais existem
-      if ((!data || data.length === 0) && storeId !== 'default_store') {
-        console.warn('[supabaseDB.products.list] Nenhum produto encontrado para store_id:', storeId);
-        console.warn('[supabaseDB.products.list] Listando TODOS os produtos para debug...');
-        const { data: allProducts, error: allError } = await supabase
+      // Primeira tentativa: buscar com store_id do usuário
+      if (storeId && storeId !== 'default_store') {
+        const { data, error } = await supabase
           .from('products')
-          .select('id, name, store_id')
-          .limit(20);
+          .select('*')
+          .eq('store_id', storeId)
+          .order('name', { ascending: true });
         
-        if (!allError && allProducts) {
-          console.warn('[supabaseDB.products.list] Produtos existentes no Supabase (primeiros 20):', 
-            allProducts.map(p => ({ id: p.id, name: p.name, store_id: p.store_id }))
-          );
+        if (!error && data && data.length > 0) {
+          console.log(`[supabaseDB] ✅ ${data.length} produtos encontrados para store_id: ${storeId}`);
+          PRODUCTS_CACHE.set(data);
+          return data;
         }
       }
       
-      return data || [];
+      // Fallback: buscar TODOS os produtos disponíveis (sem filtro de store_id)
+      const { data: allProducts, error: allError } = await supabase
+        .from('products')
+        .select('*')
+        .order('name', { ascending: true });
+      
+      if (!allError && allProducts && allProducts.length > 0) {
+        console.log(`[supabaseDB] ✅ ${allProducts.length} produtos encontrados (sem filtro de store_id)`);
+        PRODUCTS_CACHE.set(allProducts);
+        return allProducts;
+      }
+      
+      if (allError) {
+        console.error('[supabaseDB] Erro ao listar produtos:', allError);
+      }
+      
+      return [];
+    },
+    
+    // Obter produtos do cache imediatamente (sem esperar Supabase)
+    // Retorna null se cache não estiver disponível
+    getFromCache: () => {
+      return PRODUCTS_CACHE.isValid() ? PRODUCTS_CACHE.data : null;
+    },
+    
+    // Verificar se cache está válido
+    isCacheValid: () => {
+      return PRODUCTS_CACHE.isValid();
+    },
+    
+    // Limpar cache (chamar após criar/atualizar/deletar produto)
+    clearCache: () => {
+      PRODUCTS_CACHE.clear();
     },
 
     findByCode: async (code) => {
-      let storeId = getCurrentStoreId();
-      
-      // Se storeId é default_store, recuperar o real
-      if (storeId === 'default_store') {
-        storeId = await getActualStoreId();
-      }
-      
+      // Buscar direto por SKU (sem filtro de store_id para simplicidade)
       const { data, error } = await supabase
         .from('products')
         .select('*')
-        .eq('store_id', storeId)
         .eq('sku', code)
         .maybeSingle();
-      
       if (error) {
-        console.error('[supabaseDB.products.findByCode] Erro ao buscar produto:', error);
+        console.error('[supabaseDB.products.findByCode] Erro:', error);
         return null;
       }
       return data;
     },
 
     findById: async (id) => {
-      let storeId = getCurrentStoreId();
-      
-      // Se storeId é default_store, recuperar o real
-      if (storeId === 'default_store') {
-        storeId = await getActualStoreId();
-      }
-      
+      // Buscar direto por ID (sem filtro de store_id para simplicidade)
       const { data, error } = await supabase
         .from('products')
         .select('*')
-        .eq('store_id', storeId)
         .eq('id', id)
         .maybeSingle();
-
       if (error) {
-        console.error('Erro ao buscar produto por ID:', error);
+        console.error('[supabaseDB.products.findById] Erro:', error);
         return null;
       }
       return data;
@@ -143,7 +254,7 @@ export const supabaseDB = {
         throw new Error('Usuário não autenticado. Faça login primeiro.');
       }
 
-      const storeId = getCurrentStoreId(); // Sempre retorna valor válido
+      const storeId = await getCurrentStoreId(); // Sempre retorna valor válido
       
       // Verificar se produto com mesmo sku já existe (evitar duplicatas)
       if (product.sku || product.code) {
@@ -191,13 +302,15 @@ export const supabaseDB = {
         // PRIORIZAR campo stock (coluna principal)
         const stockValue = data.stock !== undefined && data.stock !== null ? data.stock : (data.stock_quantity || 0);
         await supabaseDB.updateLocalCacheStock(data.id, stockValue);
+        // Limpar cache de produtos para forçar reload
+        PRODUCTS_CACHE.clear();
       }
       
       return data;
     },
 
     update: async (id, updates, user) => {
-      let storeId = getCurrentStoreId();
+      let storeId = await getCurrentStoreId();
       
       // Se storeId é default_store, recuperar o real
       if (storeId === 'default_store') {
@@ -280,6 +393,9 @@ export const supabaseDB = {
         await supabaseDB.updateLocalCacheStock(id, newStock);
       }
       
+      // Limpar cache de produtos para forçar reload
+      PRODUCTS_CACHE.clear();
+      
       return data;
     },
 
@@ -292,25 +408,19 @@ export const supabaseDB = {
     },
 
     delete: async (id, user) => {
-      let storeId = getCurrentStoreId();
-      
-      // Se storeId é default_store, recuperar o real
-      if (storeId === 'default_store') {
-        storeId = await getActualStoreId();
-      }
-      
-      console.log('[supabaseDB.products.delete] Deletando produto com id:', id, 'store_id:', storeId);
-      
+      // Buscar produto direto por ID (sem filtro de store_id)
       const { error } = await supabase
         .from('products')
         .delete()
-        .eq('id', id)
-        .eq('store_id', storeId);
+        .eq('id', id);
       
       if (error) {
         console.error('[supabaseDB.products.delete] Erro ao deletar produto:', error);
         throw error;
       }
+      
+      // Limpar cache de produtos para forçar reload
+      PRODUCTS_CACHE.clear();
       
       console.log('[supabaseDB.products.delete] Produto deletado com sucesso:', id);
       return { success: true };
@@ -319,7 +429,7 @@ export const supabaseDB = {
     // Buscar produtos por model_name (para exclusão de modelos)
     // Tenta buscar por model_name se a coluna existir, caso contrário busca por nome que começa com o modelo
     listByModelName: async (modelName) => {
-      let storeId = getCurrentStoreId();
+      let storeId = await getCurrentStoreId();
       
       // Se storeId é default_store, recuperar o real
       if (storeId === 'default_store') {
@@ -355,7 +465,7 @@ export const supabaseDB = {
     // Atualizar produtos existentes para ter model_name, color, size baseado no nome
     // Extrai do nome do produto: "Bruna Marrom M" -> model_name="Bruna", color="Marrom", size="M"
     updateProductsModelFields: async () => {
-      let storeId = getCurrentStoreId();
+      let storeId = await getCurrentStoreId();
       
       // Se storeId é default_store, recuperar o real
       if (storeId === 'default_store') {
@@ -471,12 +581,14 @@ export const supabaseDB = {
     },
 
     list: async () => {
-      const storeId = getCurrentStoreId();
-      const { data, error } = await supabase
+      const storeId = await getCurrentStoreId();
+      let query = supabase
         .from('sales')
-        .select('*')
-        .eq('store_id', storeId)
-        .order('created_at', { ascending: false });
+        .select('*');
+      
+      query = addStoreIdFilter(query, storeId);
+      
+      const { data, error } = await query.order('created_at', { ascending: false });
       
       if (error) {
         console.error('Erro ao listar vendas:', error);
@@ -486,11 +598,14 @@ export const supabaseDB = {
     },
 
     listFinalized: async () => {
-      const storeId = getCurrentStoreId();
-      const { data, error } = await supabase
+      const storeId = await getCurrentStoreId();
+      let query = supabase
         .from('sales')
-        .select('*')
-        .eq('store_id', storeId)
+        .select('*');
+      
+      query = addStoreIdFilter(query, storeId);
+      
+      const { data, error } = await query
         .or('status.is.null,status.eq.finalized')
         .order('created_at', { ascending: false });
       
@@ -506,14 +621,25 @@ export const supabaseDB = {
     },
 
     listCancelled: async () => {
-      const all = await supabaseDB.sales.list();
-      return all
-        .map(supabaseDB.sales._normalizeSale)
-        .filter(s => s.status === 'cancelled');
+      const storeId = await getCurrentStoreId();
+      let query = supabase
+        .from('sales')
+        .select('*')
+        .eq('status', 'cancelled');
+      
+      query = addStoreIdFilter(query, storeId);
+      
+      const { data, error } = await query.order('created_at', { ascending: false });
+      
+      if (error) {
+        console.error('[supabaseDB.sales.listCancelled] Erro ao listar vendas canceladas:', error);
+        return [];
+      }
+      return (data || []).map(supabaseDB.sales._normalizeSale);
     },
 
     create: async (sale, user) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       const userId = await getCurrentUserId();
       
       // Obter cash_session_id do caixa atual
@@ -558,6 +684,264 @@ export const supabaseDB = {
       
       return supabaseDB.sales._normalizeSale(data);
     },
+    
+    /**
+     * Cria uma venda diretamente no banco (sem usar RPC)
+     * Insere a venda e atualiza o estoque dos produtos
+     * Usar este método se a RPC create_sale_atomic não funcionar
+     * 
+     * @param {Object} sale - Objeto da venda
+     * @param {string} external_id - ID externo para idempotência
+     * @returns {Promise<Object>} { status: 'ok'|'error', sale_id?, message? }
+     */
+    createSaleDirect: async (sale, external_id) => {
+      const storeId = await getCurrentStoreId();
+      const userId = await getCurrentUserId();
+      
+      console.log('[createSaleDirect] Iniciando criação direta de venda...');
+      console.log('[createSaleDirect] store_id:', storeId);
+      console.log('[createSaleDirect] user_id:', userId);
+      console.log('[createSaleDirect] external_id:', external_id);
+      
+      // Verificar se venda já existe (idempotência)
+      const { data: existingSale } = await supabase
+        .from('sales')
+        .select('id, external_id')
+        .eq('external_id', external_id)
+        .maybeSingle();
+      
+      if (existingSale) {
+        console.log('[createSaleDirect] Venda já existe:', existingSale.id);
+        return {
+          status: 'ok',
+          sale_id: existingSale.id,
+          external_id: external_id,
+          message: 'Venda já processada anteriormente',
+        };
+      }
+      
+      // Obter cash_session_id do caixa atual
+      const cashStr = localStorage.getItem('currentCashRegister');
+      let cashSessionId = null;
+      if (cashStr) {
+        try {
+          const cash = JSON.parse(cashStr);
+          const { data: session } = await supabase
+            .from('cash_sessions')
+            .select('id')
+            .eq('store_id', storeId)
+            .eq('status', 'open')
+            .maybeSingle();
+          cashSessionId = session?.id || null;
+        } catch (e) {
+          console.error('[createSaleDirect] Erro ao obter cash_session_id:', e);
+        }
+      }
+      
+      try {
+        // 1. Inserir a venda
+        // NOTA: Usar apenas colunas que existem na tabela sales do Supabase
+        // Colunas confirmadas: store_id, user_id, cash_session_id, external_id, items, total_amount, payment_method, status
+        const salePayload = {
+          store_id: storeId,
+          user_id: userId,
+          cash_session_id: cashSessionId,
+          external_id: external_id,
+          items: sale.items || [],
+          total_amount: sale.total_amount || sale.total || 0,
+          payment_method: sale.payment_method || 'money',
+          status: sale.status || 'finalized',
+        };
+        
+        const { data: newSale, error: saleError } = await supabase
+          .from('sales')
+          .insert(salePayload)
+          .select('id')
+          .single();
+        
+        if (saleError) {
+          console.error('[createSaleDirect] Erro:', saleError.message);
+          return {
+            status: 'error',
+            message: saleError.message || 'Erro ao inserir venda',
+            error_details: saleError,
+          };
+        }
+        
+        const saleId = newSale.id;
+        console.log('[createSaleDirect] ✅ Venda criada:', saleId);
+        
+        // 2. BAIXAR ESTOQUE IMEDIATAMENTE (antes de retornar)
+        const items = sale.items || [];
+        console.log('[createSaleDirect] 📦 Processando estoque para', items.length, 'itens');
+        console.log('[createSaleDirect] 📦 Items completos:', JSON.stringify(items, null, 2));
+        
+        for (const item of items) {
+          const productId = item.product_id || item.pid;
+          const quantity = item.quantity || item.qtd || 1;
+          const sku = item.sku || item.code;
+          
+          console.log('[createSaleDirect] 📦 Processando item:', {
+            product_id: productId,
+            quantity: quantity,
+            name: item.name || item.product_name,
+            sku: sku
+          });
+          
+          // SEMPRE buscar pelo SKU primeiro (mais confiável)
+          if (sku) {
+            console.log('[createSaleDirect] 🔍 Buscando produto pelo SKU:', sku, 'store_id:', storeId);
+            
+            const { data: productBySku, error: skuError } = await supabase
+              .from('products')
+              .select('id, stock_quantity, name, store_id')
+              .eq('sku', sku)
+              .maybeSingle();
+            
+            console.log('[createSaleDirect] 🔍 Resultado busca SKU:', productBySku, 'Erro:', skuError?.message);
+            
+            if (productBySku) {
+              const oldStock = productBySku.stock_quantity || 0;
+              const newStock = Math.max(0, oldStock - quantity);
+              const productStoreId = productBySku.store_id || storeId;
+              
+              console.log('[createSaleDirect] 📝 Atualizando estoque:', {
+                id: productBySku.id,
+                store_id: productStoreId,
+                oldStock,
+                newStock
+              });
+              
+              // Update COM store_id no filtro (necessário para RLS)
+              // Atualiza AMBAS as colunas: stock e stock_quantity
+              const { error: updateError } = await supabase
+                .from('products')
+                .update({ stock: newStock, stock_quantity: newStock })
+                .eq('id', productBySku.id)
+                .eq('store_id', productStoreId);
+              
+              if (updateError) {
+                console.error('[createSaleDirect] ❌ Erro ao atualizar estoque:', updateError.message, updateError);
+              } else {
+                console.log('[createSaleDirect] ✅ Update executado sem erro');
+                
+                // Verificar se realmente atualizou
+                const { data: checkProduct } = await supabase
+                  .from('products')
+                  .select('stock_quantity')
+                  .eq('id', productBySku.id)
+                  .single();
+                
+                if (checkProduct?.stock_quantity === newStock) {
+                  console.log('[createSaleDirect] ✅✅ ESTOQUE ATUALIZADO COM SUCESSO:', productBySku.name, oldStock, '->', newStock);
+                } else {
+                  console.error('[createSaleDirect] ❌❌ ESTOQUE NÃO ATUALIZOU! Esperado:', newStock, 'Atual:', checkProduct?.stock_quantity);
+                  console.log('[createSaleDirect] 💡 Tentando update direto por RPC...');
+                  
+                  // Tentar via RPC se existir
+                  const { error: rpcError } = await supabase.rpc('update_product_stock', {
+                    p_product_id: productBySku.id,
+                    p_new_stock: newStock
+                  });
+                  
+                  if (rpcError) {
+                    console.log('[createSaleDirect] RPC não disponível:', rpcError.message);
+                    
+                    // Última tentativa: update sem filtro de store_id
+                    console.log('[createSaleDirect] 💡 Tentando update sem store_id...');
+                    const { error: simpleError } = await supabase
+                      .from('products')
+                      .update({ stock: newStock, stock_quantity: newStock })
+                      .eq('id', productBySku.id);
+                    
+                    if (simpleError) {
+                      console.error('[createSaleDirect] ❌ Update simples falhou:', simpleError.message);
+                    }
+                    
+                    // Verificar novamente
+                    const { data: finalCheck } = await supabase
+                      .from('products')
+                      .select('stock_quantity')
+                      .eq('id', productBySku.id)
+                      .single();
+                    
+                    console.log('[createSaleDirect] 🔍 Verificação final - estoque:', finalCheck?.stock_quantity);
+                  }
+                }
+              }
+              continue;
+            }
+          }
+          
+          // Se não encontrou pelo SKU, tentar pelo UUID
+          if (productId) {
+            const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+            if (uuidRegex.test(productId)) {
+              console.log('[createSaleDirect] 🔍 Buscando produto pelo UUID:', productId);
+              
+              try {
+                const { data: product, error: fetchError } = await supabase
+                  .from('products')
+                  .select('stock_quantity, name')
+                  .eq('id', productId)
+                  .single();
+                
+                console.log('[createSaleDirect] 🔍 Resultado busca UUID:', product, 'Erro:', fetchError?.message);
+                
+                if (fetchError) {
+                  console.error('[createSaleDirect] Erro ao buscar produto:', productId, fetchError.message);
+                  continue;
+                }
+                
+                if (product) {
+                  const oldStock = product.stock_quantity || 0;
+                  const newStock = Math.max(0, oldStock - quantity);
+                  
+                  console.log('[createSaleDirect] 📝 Atualizando estoque:', productId, oldStock, '->', newStock);
+                  
+                  const { data: updateResult, error: updateError } = await supabase
+                    .from('products')
+                    .update({ stock_quantity: newStock })
+                    .eq('id', productId)
+                    .select();
+                  
+                  if (updateError) {
+                    console.error('[createSaleDirect] ❌ Erro ao atualizar estoque:', productId, updateError.message);
+                  } else {
+                    console.log('[createSaleDirect] ✅ Estoque atualizado:', product.name, oldStock, '->', newStock, '(-' + quantity + ')');
+                    console.log('[createSaleDirect] ✅ Resultado update:', updateResult);
+                  }
+                }
+              } catch (e) {
+                console.error('[createSaleDirect] Erro estoque:', productId, e.message);
+              }
+            } else {
+              console.warn('[createSaleDirect] ⚠️ product_id não é UUID válido:', productId);
+            }
+          } else {
+            console.warn('[createSaleDirect] ⚠️ Item sem product_id nem SKU:', item);
+          }
+        }
+        
+        // Limpar cache de produtos
+        PRODUCTS_CACHE.clear();
+        
+        return {
+          status: 'ok',
+          sale_id: saleId,
+          external_id: external_id,
+          message: 'Venda criada com sucesso',
+        };
+        
+      } catch (error) {
+        console.error('[createSaleDirect] Erro inesperado:', error);
+        return {
+          status: 'error',
+          message: error.message || 'Erro inesperado ao criar venda',
+          error_details: error,
+        };
+      }
+    },
 
     /**
      * Cria uma venda de forma atômica usando a função RPC create_sale_atomic
@@ -568,7 +952,7 @@ export const supabaseDB = {
      * @returns {Promise<Object>} { status: 'ok'|'already_exists'|'insufficient_stock'|'error', sale_id?, message? }
      */
     callCreateSaleAtomic: async (sale, external_id) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       const userId = await getCurrentUserId();
       
       // Obter cash_session_id do caixa atual
@@ -598,8 +982,20 @@ export const supabaseDB = {
         if (!item.code && !item.sku) {
           console.warn('[callCreateSaleAtomic] Item sem SKU:', item);
         }
+        
+        // Log detalhado de cada item
+        console.log('[callCreateSaleAtomic] Processando item:', {
+          product_id: item.product_id,
+          code: item.code,
+          sku: item.sku,
+          quantity: item.quantity,
+          name: item.name,
+          pid: item.pid
+        });
+        
         return {
           ...item,
+          product_id: item.product_id || item.pid, // Garantir que product_id está presente
           code: item.code || item.sku || null, // SKU é obrigatório para busca na RPC
         };
       });
@@ -833,25 +1229,20 @@ export const supabaseDB = {
     },
 
     cancel: async (id, password, user) => {
-      // TODO: Implementar validação de senha e cancelamento
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       
+      // Apenas atualizar o status para 'cancelled'
       const { data, error } = await supabase
         .from('sales')
-        .update({ 
-          status: 'cancelled',
-          cancelled_at: new Date().toISOString(),
-        })
-        .eq('id', id)
-        .eq('store_id', storeId)
-        .select()
-        .single();
+        .update({ status: 'cancelled' })
+        .eq('id', id);
       
       if (error) {
-        console.error('Erro ao cancelar venda:', error);
+        console.error('[supabaseDB.sales.cancel] Erro:', error);
         return { success: false, message: error.message };
       }
       
+      console.log('[supabaseDB.sales.cancel] ✅ Venda cancelada:', id);
       return { success: true, message: 'Venda cancelada com sucesso' };
     },
   },
@@ -861,7 +1252,7 @@ export const supabaseDB = {
   // ============================================
   cashSessions: {
     create: async (openingValue, posId = null) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       const userId = await getCurrentUserId();
       
       const { data, error } = await supabase
@@ -885,7 +1276,7 @@ export const supabaseDB = {
     },
 
     close: async (sessionId, closingAmount) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       
       const { data, error } = await supabase
         .from('cash_sessions')
@@ -908,7 +1299,7 @@ export const supabaseDB = {
     },
 
     getCurrent: async () => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       const userId = await getCurrentUserId();
       
       const { data, error } = await supabase
@@ -935,7 +1326,7 @@ export const supabaseDB = {
   // ============================================
   users: {
     list: async () => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       const { data, error } = await supabase
         .from('users')
         .select('*')
@@ -961,7 +1352,7 @@ export const supabaseDB = {
   getAllProducts: async (store_id) => {
     if (!store_id) {
       console.warn('[getAllProducts] store_id não fornecido, usando getCurrentStoreId()');
-      store_id = getCurrentStoreId();
+      store_id = await getCurrentStoreId();
     }
     
     const { data, error } = await supabase
@@ -989,7 +1380,7 @@ export const supabaseDB = {
   updateLocalCacheStock: async (product_id, qty) => {
     try {
       // Buscar cache local de produtos
-      const tenantId = getCurrentStoreId();
+      const tenantId = await getCurrentStoreId();
       const dbKey = `mozyc_pdv_db_v2_tenant_${tenantId}`;
       const dbStr = localStorage.getItem(dbKey);
       
@@ -1034,7 +1425,7 @@ export const supabaseDB = {
   // ============================================
   coupons: {
     list: async () => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       const { data, error } = await supabase
         .from('coupons')
         .select('*')
@@ -1049,7 +1440,7 @@ export const supabaseDB = {
     },
 
     findByCode: async (code) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       const { data, error } = await supabase
         .from('coupons')
         .select('*')
@@ -1066,7 +1457,7 @@ export const supabaseDB = {
     },
 
     create: async (coupon, user) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       const userId = await getCurrentUserId();
       
       const { data, error } = await supabase
@@ -1090,7 +1481,7 @@ export const supabaseDB = {
     },
 
     update: async (id, updates, user) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       
       const updateData = {};
       if (updates.code !== undefined) updateData.code = updates.code;
@@ -1115,7 +1506,7 @@ export const supabaseDB = {
     },
 
     delete: async (id, user) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       
       const { error } = await supabase
         .from('coupons')
@@ -1138,12 +1529,14 @@ export const supabaseDB = {
   // ============================================
   expenses: {
     list: async () => {
-      const storeId = getCurrentStoreId();
-      const { data, error } = await supabase
+      const storeId = await getCurrentStoreId();
+      let query = supabase
         .from('expenses')
-        .select('*')
-        .eq('store_id', storeId)
-        .order('date', { ascending: false });
+        .select('*');
+      
+      query = addStoreIdFilter(query, storeId);
+      
+      const { data, error } = await query.order('date', { ascending: false });
       
       if (error) {
         console.error('[supabaseDB.expenses.list] Erro ao listar despesas:', error);
@@ -1153,7 +1546,7 @@ export const supabaseDB = {
     },
 
     create: async (expense, user) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       const userId = await getCurrentUserId();
       
       const { data, error } = await supabase
@@ -1164,6 +1557,7 @@ export const supabaseDB = {
           amount: expense.amount,
           date: expense.date,
           category: expense.category || null,
+          frequency: expense.frequency || 'rotativa', // 'fixa' ou 'rotativa' (padrão: rotativa)
           created_by: userId,
         })
         .select()
@@ -1179,13 +1573,14 @@ export const supabaseDB = {
     },
 
     update: async (id, updates, user) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       
       const updateData = {};
       if (updates.description !== undefined) updateData.description = updates.description;
       if (updates.amount !== undefined) updateData.amount = updates.amount;
       if (updates.date !== undefined) updateData.date = updates.date;
       if (updates.category !== undefined) updateData.category = updates.category;
+      if (updates.frequency !== undefined) updateData.frequency = updates.frequency; // 'fixa' ou 'rotativa'
       
       const { data, error } = await supabase
         .from('expenses')
@@ -1205,7 +1600,7 @@ export const supabaseDB = {
     },
 
     delete: async (id, user) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       
       const { error } = await supabase
         .from('expenses')
@@ -1228,12 +1623,14 @@ export const supabaseDB = {
   // ============================================
   closures: {
     list: async () => {
-      const storeId = getCurrentStoreId();
-      const { data, error } = await supabase
+      const storeId = await getCurrentStoreId();
+      let query = supabase
         .from('cash_closures')
-        .select('*')
-        .eq('store_id', storeId)
-        .order('date', { ascending: false });
+        .select('*');
+      
+      query = addStoreIdFilter(query, storeId);
+      
+      const { data, error } = await query.order('date', { ascending: false });
       
       if (error) {
         console.error('[supabaseDB.closures.list] Erro ao listar fechamentos:', error);
@@ -1243,13 +1640,16 @@ export const supabaseDB = {
     },
 
     getByDate: async (date) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       const targetDate = new Date(date).toISOString().split('T')[0];
       
-      const { data, error } = await supabase
+      let query = supabase
         .from('cash_closures')
-        .select('*')
-        .eq('store_id', storeId)
+        .select('*');
+      
+      query = addStoreIdFilter(query, storeId);
+      
+      const { data, error } = await query
         .eq('date', targetDate)
         .maybeSingle();
       
@@ -1261,14 +1661,16 @@ export const supabaseDB = {
     },
 
     getById: async (id) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       
-      const { data, error } = await supabase
+      let query = supabase
         .from('cash_closures')
         .select('*')
-        .eq('id', id)
-        .eq('store_id', storeId)
-        .maybeSingle();
+        .eq('id', id);
+      
+      query = addStoreIdFilter(query, storeId);
+      
+      const { data, error } = await query.maybeSingle();
       
       if (error) {
         console.error('[supabaseDB.closures.getById] Erro ao buscar fechamento:', error);
@@ -1278,7 +1680,7 @@ export const supabaseDB = {
     },
 
     create: async (closure, user) => {
-      const storeId = getCurrentStoreId();
+      const storeId = await getCurrentStoreId();
       const userId = await getCurrentUserId();
       const safeDate = (() => {
         const value = closure.date || closure.closureDate || new Date();

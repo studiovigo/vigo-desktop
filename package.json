@@ -112,7 +112,7 @@
         "nsis",
         "portable"
       ],
-      "icon": "imag/ICONE SISTEMA.png",
+      "icon": "imag/icon.ico",
       "certificateFile": null,
       "certificatePassword": null
     },
@@ -121,9 +121,8 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true,
-      "installerIcon": "imag/ICONE SISTEMA.png",
-      "uninstallerIcon": "imag/ICONE SISTEMA.png",
-      "installerHeaderIcon": "imag/ICONE SISTEMA.png"
+      "installerIcon": "imag/icon.ico",
+      "uninstallerIcon": "imag/icon.ico"
     },
     "linux": {
       "target": [

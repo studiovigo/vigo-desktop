@@ -1,49 +1,29 @@
-// Importar supabaseDB para sincronização (usando import dinâmico)
-let supabaseDB = null;
-const loadSupabaseDB = async () => {
-  if (!supabaseDB) {
-    try {
-      const module = await import('./supabaseDB.js');
-      supabaseDB = module.supabaseDB;
-    } catch (e) {
-      console.warn('[db.js] SupabaseDB não disponível, usando apenas localStorage');
-    }
-  }
+
+
+
+// Todas as funções de dados agora usam apenas Supabase (store_id)
+import { supabaseDB } from './supabaseDB.js';
+
+// Helper para carregar supabaseDB (para compatibilidade com código existente)
+async function loadSupabaseDB() {
   return supabaseDB;
-};
+}
 
-// Função para obter a chave do banco baseada no tenantId
-const getDBKey = (tenantId) => {
-  // Se não houver tenantId, usa uma chave padrão (compatibilidade com versões antigas)
-  if (!tenantId) {
-    return "mozyc_pdv_db_v2";
-  }
-  // Cada tenant tem seu próprio namespace no localStorage
-  return `mozyc_pdv_db_v2_tenant_${tenantId}`;
-};
-
-// Função para obter o tenantId do usuário logado
-const getCurrentTenantId = () => {
+// Helper para obter store_id do usuário logado (localStorage)
+function getLoggedUserStoreId() {
   try {
-    const userStr = localStorage.getItem('mozyc_pdv_current_user');
-    if (userStr) {
-      const user = JSON.parse(userStr);
-      // Se o usuário for ADMIN, usa o email como tenantId
-      // Se for GERENTE/CAIXA, usa o tenantId do admin que o criou
-      if (user.role === 'admin' && user.email) {
-        return user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
-      }
-      if (user.tenantId) {
-        return user.tenantId;
+    const localUser = localStorage.getItem('mozyc_pdv_current_user');
+    if (localUser) {
+      const parsed = JSON.parse(localUser);
+      if (parsed.store_id && parsed.store_id !== 'default_store') {
+        return parsed.store_id;
       }
     }
   } catch (e) {
-    // Erro ao parsear, retorna null
+    // ignore parse error
   }
   return null;
-};
-
-const DB_KEY_DEFAULT = "mozyc_pdv_db_v2";
+}
 
 // Dados iniciais (sem usuário padrão)
 const INITIAL_DB = {
@@ -92,70 +72,156 @@ const PLANS = {
   }
 };
 
+// Função síncrona para carregar dados LOCAIS (localStorage) - não usa Supabase
+const loadDBLocal = () => {
+  try {
+    const tenantId = getLoggedUserStoreId() || (() => {
+      try {
+        const userStr = localStorage.getItem('mozyc_pdv_current_user');
+        if (userStr) {
+          const user = JSON.parse(userStr);
+          if (user.role === 'admin' && user.email) {
+            return user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
+          }
+          if (user.tenantId) {
+            return user.tenantId;
+          }
+        }
+      } catch (e) {}
+      return null;
+    })();
+    
+    const dbKey = tenantId ? `mozyc_pdv_db_v2_tenant_${tenantId}` : 'mozyc_pdv_db_v2';
+    const dbData = JSON.parse(localStorage.getItem(dbKey) || '{}');
+    
+    return {
+      products: dbData.products || [],
+      productModels: dbData.productModels || [],
+      users: dbData.users || [],
+      sales: dbData.sales || [],
+      coupons: dbData.coupons || [],
+      logs: dbData.logs || [],
+      settings: dbData.settings || {},
+      expenses: dbData.expenses || [],
+      closures: dbData.closures || [],
+      cashOpenings: dbData.cashOpenings || [],
+      onlineOrders: dbData.onlineOrders || [],
+      subscriptions: dbData.subscriptions || [],
+      pendingRegistrations: dbData.pendingRegistrations || [],
+    };
+  } catch (e) {
+    console.error('[loadDBLocal] Erro:', e);
+    return {
+      products: [],
+      productModels: [],
+      users: [],
+      sales: [],
+      coupons: [],
+      logs: [],
+      settings: {},
+      expenses: [],
+      closures: [],
+      cashOpenings: [],
+      onlineOrders: [],
+      subscriptions: [],
+      pendingRegistrations: [],
+    };
+  }
+};
 
-const loadDB = () => {
-  const tenantId = getCurrentTenantId();
-  const dbKey = getDBKey(tenantId);
-  const str = localStorage.getItem(dbKey);
-  if (!str) {
-    const initialData = { ...INITIAL_DB, tenantId: tenantId || 'default' };
-    localStorage.setItem(dbKey, JSON.stringify(initialData));
-    return initialData;
-  }
-  const data = JSON.parse(str);
-  // Remover usuário padrão "Adriano Admin" caso exista no banco local
-  if (Array.isArray(data.users) && data.users.length > 0) {
-    const before = data.users.length;
-    data.users = data.users.filter(u =>
-      u.id !== 'admin' &&
-      u.email !== 'admin@lbbrand.com' &&
-      u.name !== 'Adriano Admin' &&
-      u.cpf !== '00000000000'
-    );
-    if (data.users.length !== before) {
-      saveDB(data);
-    }
-  }
-  // Limpar usuário atual se for o Adriano Admin
+// Função para salvar dados LOCAIS (localStorage)
+const saveDBLocal = (data) => {
   try {
-    const currentUserStr = localStorage.getItem('mozyc_pdv_current_user');
-    if (currentUserStr) {
-      const currentUser = JSON.parse(currentUserStr);
-      if (
-        currentUser?.id === 'admin' ||
-        currentUser?.email === 'admin@lbbrand.com' ||
-        currentUser?.name === 'Adriano Admin' ||
-        currentUser?.cpf === '00000000000'
-      ) {
-        localStorage.removeItem('mozyc_pdv_current_user');
-      }
-    }
+    const tenantId = getLoggedUserStoreId() || (() => {
+      try {
+        const userStr = localStorage.getItem('mozyc_pdv_current_user');
+        if (userStr) {
+          const user = JSON.parse(userStr);
+          if (user.role === 'admin' && user.email) {
+            return user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
+          }
+          if (user.tenantId) {
+            return user.tenantId;
+          }
+        }
+      } catch (e) {}
+      return null;
+    })();
+    
+    const dbKey = tenantId ? `mozyc_pdv_db_v2_tenant_${tenantId}` : 'mozyc_pdv_db_v2';
+    localStorage.setItem(dbKey, JSON.stringify(data));
   } catch (e) {
-    // Ignorar falhas de parse
+    console.error('[saveDBLocal] Erro:', e);
   }
-  // Run local migrations to ensure schema includes new sales metrics
+};
+
+// Nova função: carrega dados diretamente do Supabase
+const loadDB = async () => {
+  // Carregar produtos, usuários, vendas, etc. do Supabase
+  const [products, users, sales, coupons, logs, settings, expenses, closures, cashOpenings, onlineOrders, subscriptions, pendingRegistrations] = await Promise.all([
+    supabaseDB.products.list(),
+    supabaseDB.users?.list ? supabaseDB.users.list() : [],
+    supabaseDB.sales?.list ? supabaseDB.sales.list() : [],
+    Promise.resolve([]), // coupons
+    Promise.resolve([]), // logs
+    Promise.resolve({}), // settings
+    supabaseDB.expenses?.list ? supabaseDB.expenses.list() : [],
+    supabaseDB.closures?.list ? supabaseDB.closures.list() : [],
+    Promise.resolve([]), // cashOpenings
+    Promise.resolve([]), // onlineOrders
+    Promise.resolve([]), // subscriptions
+    Promise.resolve([]), // pendingRegistrations
+  ]);
+  
+  // Carregar productModels do localStorage (não existe no Supabase)
+  let productModels = [];
   try {
-    migrateLocalSalesSchema(data);
+    const tenantId = getLoggedUserStoreId() || (() => {
+      try {
+        const userStr = localStorage.getItem('mozyc_pdv_current_user');
+        if (userStr) {
+          const user = JSON.parse(userStr);
+          if (user.role === 'admin' && user.email) {
+            return user.email.toLowerCase().replace(/[^a-z0-9]/g, '_');
+          }
+          if (user.tenantId) {
+            return user.tenantId;
+          }
+        }
+      } catch (e) {}
+      return null;
+    })();
+    
+    const dbKey = tenantId ? `mozyc_pdv_db_v2_tenant_${tenantId}` : 'mozyc_pdv_db_v2';
+    const dbData = JSON.parse(localStorage.getItem(dbKey) || '{}');
+    productModels = dbData.productModels || [];
   } catch (e) {
-    console.warn('[loadDB] Erro ao migrar schema local:', e);
+    console.error('[loadDB] Erro ao carregar productModels do localStorage:', e);
   }
-  // Garantir que tenantId está presente
-  if (!data.tenantId) {
-    data.tenantId = tenantId || 'default';
-    saveDB(data);
-  }
-  return data;
+  
+  return {
+    products,
+    users,
+    sales,
+    coupons,
+    logs,
+    settings,
+    expenses,
+    closures,
+    cashOpenings,
+    onlineOrders,
+    subscriptions,
+    pendingRegistrations,
+    productModels,
+  };
 };
 
 
+
+// saveDB agora é um NO-OP (não faz nada)
 const saveDB = (data) => {
-  const tenantId = getCurrentTenantId();
-  const dbKey = getDBKey(tenantId);
-  // Garantir que tenantId está presente nos dados
-  if (!data.tenantId) {
-    data.tenantId = tenantId || 'default';
-  }
-  localStorage.setItem(dbKey, JSON.stringify(data));
+  // Não salva mais localmente
+  return;
 };
 
 // Local migration: ensure sales entries include new metric fields
@@ -179,6 +245,7 @@ const migrateLocalSalesSchema = (data) => {
 
 // Função auxiliar de log
 const addLog = (data, user, action) => {
+  if (!data.logs) data.logs = [];
   data.logs.unshift({
     id: crypto.randomUUID(),
     timestamp: new Date().toISOString(),
@@ -195,49 +262,18 @@ const addLog = (data, user, action) => {
  */
 const syncProductsFromSupabase = async () => {
   try {
-    const sdb = await loadSupabaseDB();
-    if (!sdb) {
-      console.warn('[syncProductsFromSupabase] SupabaseDB não disponível');
-      return;
-    }
-
-    // Obter storeId usando resolveStoreId do supabaseSync
-    let storeId = null;
-    try {
-      const syncModule = await import('./supabaseSync.js');
-      storeId = syncModule.resolveStoreId();
-      console.log('[syncProductsFromSupabase] StoreId resolvido:', storeId);
-    } catch (e) {
-      console.error('[syncProductsFromSupabase] Erro ao obter storeId:', e);
-    }
-
-    // Carregar produtos locais PRIMEIRO
-    const data = loadDB();
+    // Usar supabaseDB diretamente
+    // Carregar produtos locais PRIMEIRO (async)
+    const data = await loadDB();
     const localProducts = data.products || [];
     console.log(`[syncProductsFromSupabase] ${localProducts.length} produtos encontrados localmente`);
 
-    // IMPORTANTE: Se storeId não foi encontrado e há produtos locais, usar o store_id do primeiro produto local
-    if ((!storeId || storeId === 'default_store') && localProducts.length > 0) {
-      const firstLocalProduct = localProducts[0];
-      if (firstLocalProduct.store_id && firstLocalProduct.store_id !== 'default_store') {
-        console.log('[syncProductsFromSupabase] ⚠️ StoreId padrão detectado, usando store_id do primeiro produto local:', firstLocalProduct.store_id);
-        storeId = firstLocalProduct.store_id;
-      }
-    }
-
-    if (!storeId) {
-      console.warn('[syncProductsFromSupabase] storeId não disponível');
-      return;
-    }
-
-    // Carregar produtos do Supabase com o store_id correto
-    console.log('[syncProductsFromSupabase] Chamando sdb.products.list() com store_id:', storeId);
-    const supabaseProducts = await sdb.products.list();
+    // Carregar produtos do Supabase
+    const supabaseProducts = await supabaseDB.products.list();
     console.log(`[syncProductsFromSupabase] ${supabaseProducts.length} produtos encontrados no Supabase`);
 
     // Carregar modelos para vincular modelId baseado em modelName
     const models = data.productModels || [];
-    
     // Converter produtos do Supabase para formato local
     const convertedProducts = supabaseProducts.map(supProd => {
       // Tentar vincular modelId baseado em modelName se modelId estiver vazio
@@ -394,9 +430,18 @@ export const db = {
   },
   
   products: {
-    list: () => loadDB().products,
-    findByCode: (code) => loadDB().products.find(p => p.code === code),
-    listByModel: (modelId) => loadDB().products.filter(p => p.modelId === modelId),
+    list: async () => {
+      const data = await loadDB();
+      return data.products || [];
+    },
+    findByCode: async (code) => {
+      const data = await loadDB();
+      return (data.products || []).find(p => p.code === code);
+    },
+    listByModel: async (modelId) => {
+      const data = await loadDB();
+      return (data.products || []).filter(p => p.modelId === modelId);
+    },
     create: async (prod, user) => {
       // Salvar no Supabase primeiro
       const sdb = await loadSupabaseDB();
@@ -424,9 +469,14 @@ export const db = {
       // Para evitar duplicação, vamos verificar se já existe antes de adicionar
       const data = loadDB();
       
-      // IMPORTANTE: Garantir que o produto tem store_id
-      if (!prod.store_id) {
-        prod.store_id = 'default_store'; // Use fallback padrão
+      // IMPORTANTE: Garantir que o produto tem store_id do usuário logado
+      if (!prod.store_id || prod.store_id === 'default_store') {
+        const userStoreId = getLoggedUserStoreId();
+        if (userStoreId) {
+          prod.store_id = userStoreId;
+        } else {
+          console.warn('[db.products.create] Usuário não tem store_id definido!');
+        }
       }
       
       // Verificar se produto já existe (por ID ou código)
@@ -554,9 +604,9 @@ export const db = {
     }
   },
   productModels: {
-    list: () => loadDB().productModels || [],
+    list: async () => (await loadDB()).productModels || [],
     create: async (model, user) => {
-      const data = loadDB();
+      const data = await loadDB();
       if (!data.productModels) data.productModels = [];
       
       const modelCode = model.name.slice(0, 3).toUpperCase() + Math.random().toString(36).slice(2, 6).toUpperCase();
@@ -565,7 +615,6 @@ export const db = {
       addLog(data, user, `Cadastrou modelo: ${model.name}`);
 
       // Create individual products from variations
-      const sdb = await loadSupabaseDB();
       for (const v of model.variations) {
         // Usar SKU gerado no frontend, ou gerar um se não existir
         const productSku = v.sku || `${modelCode}-${v.color.slice(0,2).toUpperCase()}-${v.size}`;
@@ -589,17 +638,15 @@ export const db = {
         };
         
         // Salvar no Supabase primeiro
-        if (sdb) {
-          try {
-            const createdProduct = await sdb.products.create(newProduct, user);
-            if (createdProduct && createdProduct.id) {
-              newProduct.id = createdProduct.id;
-              console.log(`[productModels.create] Produto criado no Supabase: ${newProduct.name} (${newProduct.id})`);
-            }
-          } catch (error) {
-            console.error('[productModels.create] Erro ao salvar produto no Supabase:', error);
-            // Continuar salvando localmente mesmo se falhar no Supabase
+        try {
+          const createdProduct = await supabaseDB.products.create(newProduct, user);
+          if (createdProduct && createdProduct.id) {
+            newProduct.id = createdProduct.id;
+            console.log(`[productModels.create] Produto criado no Supabase: ${newProduct.name} (${newProduct.id})`);
           }
+        } catch (error) {
+          console.error('[productModels.create] Erro ao salvar produto no Supabase:', error);
+          // Continuar salvando localmente mesmo se falhar no Supabase
         }
         
         // Verificar se produto já existe antes de adicionar (evitar duplicatas)
@@ -812,125 +859,153 @@ export const db = {
           throw new Error('Usuário não definido. Faça login novamente.');
         }
         
-        const data = loadDB();
-        if (!data.productModels) {
-          console.warn('[productModels.delete] Nenhum modelo encontrado no localStorage');
-          throw new Error('Nenhum modelo encontrado no banco de dados local');
-        }
+        console.log(`[productModels.delete] Iniciando exclusão do modelo: ${id}`);
         
-        const model = data.productModels.find(m => m.id === id);
-        if (!model) {
-          console.warn(`[productModels.delete] Modelo ${id} não encontrado`);
-          throw new Error(`Modelo com ID ${id} não encontrado`);
-        }
-        
-        console.log(`[productModels.delete] Iniciando exclusão do modelo: ${model.name} (${id})`);
-        
-        // Encontrar todos os produtos relacionados ao modelo (localmente)
-        const relatedProducts = data.products.filter(p => p.modelId === id || p.modelName === model.name);
-        console.log(`[productModels.delete] Encontrados ${relatedProducts.length} produto(s) relacionados ao modelo localmente`);
-        
-        // Deletar produtos no Supabase antes de deletar localmente
+        // Carregar supabaseDB
         const sdb = await loadSupabaseDB();
+        
+        if (!sdb) {
+          throw new Error('Conexão com Supabase não disponível');
+        }
+        
+        // Buscar produtos do modelo no Supabase
+        // Primeiro, precisamos identificar o modelo pelo ID ou buscar produtos relacionados
+        let modelName = null;
+        let supabaseProducts = [];
+        
+        // Buscar todos os produtos e filtrar pelo modelo
+        try {
+          const allProducts = await sdb.products.list();
+          
+          // Encontrar produtos que pertencem a este modelo
+          // O ID do modelo pode estar no campo modelId ou o nome no model_name
+          supabaseProducts = allProducts.filter(p => {
+            // Verificar se o produto pertence ao modelo pelo ID
+            if (p.modelId === id || p.model_id === id) return true;
+            
+            // Verificar pelo nome do modelo (se começar com o mesmo padrão)
+            if (p.model_name && p.model_name === id) return true;
+            
+            return false;
+          });
+          
+          // Se não encontrou por modelId, tentar extrair o nome do modelo do primeiro produto
+          if (supabaseProducts.length === 0) {
+            // Buscar pelo nome: produtos que têm nome no formato "MODELO - COR - TAM"
+            const productsWithModelPattern = allProducts.filter(p => {
+              const nameParts = (p.name || '').split(' - ');
+              return nameParts.length >= 1;
+            });
+            
+            // Agrupar por possível nome de modelo (primeira parte do nome)
+            const modelGroups = {};
+            for (const p of productsWithModelPattern) {
+              const possibleModelName = (p.name || '').split(' - ')[0];
+              if (!modelGroups[possibleModelName]) {
+                modelGroups[possibleModelName] = [];
+              }
+              modelGroups[possibleModelName].push(p);
+            }
+            
+            // Verificar se o ID corresponde a algum grupo
+            // Também verificar dados locais para encontrar o nome do modelo
+            const data = loadDB();
+            const localModel = (data.productModels || []).find(m => m.id === id);
+            
+            if (localModel) {
+              modelName = localModel.name;
+              supabaseProducts = allProducts.filter(p => {
+                const productModelName = (p.name || '').split(' - ')[0];
+                return productModelName === modelName || p.model_name === modelName;
+              });
+              console.log(`[productModels.delete] Encontrado modelo local: ${modelName}, ${supabaseProducts.length} produtos no Supabase`);
+            } else {
+              // Tentar usar o ID como nome do modelo diretamente
+              supabaseProducts = allProducts.filter(p => {
+                const productModelName = (p.name || '').split(' - ')[0];
+                return productModelName === id || p.model_name === id;
+              });
+              if (supabaseProducts.length > 0) {
+                modelName = id;
+              }
+            }
+          } else {
+            // Extrair nome do modelo do primeiro produto
+            if (supabaseProducts[0]) {
+              modelName = supabaseProducts[0].model_name || (supabaseProducts[0].name || '').split(' - ')[0];
+            }
+          }
+          
+          console.log(`[productModels.delete] Encontrados ${supabaseProducts.length} produto(s) no Supabase para o modelo`);
+        } catch (error) {
+          console.error('[productModels.delete] Erro ao buscar produtos no Supabase:', error);
+        }
+        
+        // Deletar produtos no Supabase
         let supabaseDeletedCount = 0;
         let supabaseErrorCount = 0;
         const supabaseErrors = [];
         
-        if (sdb) {
-          // Buscar produtos no Supabase por model_name (nome do modelo)
+        for (const product of supabaseProducts) {
           try {
-            const supabaseProducts = await sdb.products.listByModelName(model.name);
-            console.log(`[productModels.delete] Encontrados ${supabaseProducts.length} produto(s) no Supabase com model_name: ${model.name}`);
-            
-            // Deletar produtos encontrados no Supabase
-            for (const supabaseProduct of supabaseProducts) {
-              try {
-                console.log(`[productModels.delete] Tentando deletar produto no Supabase: ${supabaseProduct.name} (${supabaseProduct.id})`);
-                await sdb.products.delete(supabaseProduct.id, user);
-                supabaseDeletedCount++;
-                console.log(`[productModels.delete] ✓ Produto deletado no Supabase: ${supabaseProduct.name} (${supabaseProduct.id})`);
-              } catch (error) {
-                console.error(`[productModels.delete] ✗ Erro ao deletar produto ${supabaseProduct.id} no Supabase:`, error);
-                supabaseErrors.push({ productId: supabaseProduct.id, productName: supabaseProduct.name, error: error.message || error });
-                supabaseErrorCount++;
-                // Continuar deletando outros produtos mesmo se este falhar
-              }
-            }
-            
-            // Também tentar deletar produtos locais que têm ID UUID (foram criados no Supabase)
-            for (const product of relatedProducts) {
-              const isUUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(product.id);
-              
-              // Se o produto tem UUID mas não foi encontrado na busca por model_name, tentar deletar pelo ID
-              if (isUUID && !supabaseProducts.some(sp => sp.id === product.id)) {
-                try {
-                  console.log(`[productModels.delete] Tentando deletar produto pelo ID (não encontrado por model_name): ${product.name} (${product.id})`);
-                  await sdb.products.delete(product.id, user);
-                  supabaseDeletedCount++;
-                  console.log(`[productModels.delete] ✓ Produto deletado no Supabase pelo ID: ${product.name} (${product.id})`);
-                } catch (error) {
-                  console.error(`[productModels.delete] ✗ Erro ao deletar produto ${product.id} no Supabase:`, error);
-                  supabaseErrors.push({ productId: product.id, productName: product.name, error: error.message || error });
-                  supabaseErrorCount++;
-                }
-              }
-            }
-            
-            if (supabaseDeletedCount > 0) {
-              console.log(`[productModels.delete] ✓ ${supabaseDeletedCount} produto(s) deletado(s) com sucesso no Supabase`);
-            }
-            if (supabaseErrorCount > 0) {
-              console.warn(`[productModels.delete] ⚠ ${supabaseErrorCount} produto(s) falharam ao deletar no Supabase:`, supabaseErrors);
-              console.warn(`[productModels.delete] Produtos serão deletados localmente mesmo assim`);
-            }
+            console.log(`[productModels.delete] Deletando produto: ${product.name} (${product.id})`);
+            await sdb.products.delete(product.id, user);
+            supabaseDeletedCount++;
+            console.log(`[productModels.delete] ✓ Produto deletado: ${product.name}`);
           } catch (error) {
-            console.error('[productModels.delete] Erro ao buscar produtos no Supabase:', error);
-            // Continuar deletando localmente mesmo se falhar
+            console.error(`[productModels.delete] ✗ Erro ao deletar produto ${product.id}:`, error);
+            supabaseErrors.push({ productId: product.id, productName: product.name, error: error.message || error });
+            supabaseErrorCount++;
           }
-        } else {
-          console.warn('[productModels.delete] SupabaseDB não disponível, deletando apenas localmente');
         }
         
-        // Se temos Supabase disponível e houve falhas ao deletar lá, abortar para evitar
-        // remoção local que deixaria dados inconsistentes (por exemplo registros "nulos").
-        if (sdb && supabaseErrorCount > 0) {
-          console.error('[productModels.delete] Existem erros ao deletar produtos no Supabase, abortando remoção local', supabaseErrors);
-          throw new Error('Falha ao deletar alguns produtos no Supabase. Operação abortada para evitar inconsistência local.');
+        if (supabaseErrorCount > 0) {
+          console.warn(`[productModels.delete] ⚠ ${supabaseErrorCount} produto(s) falharam ao deletar`);
         }
-
-        // Deletar modelo e produtos localmente (apenas quando Supabase ausente ou remoção remota bem-sucedida)
-        const productsBeforeDelete = data.products.length;
-        data.productModels = data.productModels.filter(m => m.id !== id);
-        data.products = data.products.filter(p => p.modelId !== id && p.modelName !== model.name);
-        const productsAfterDelete = data.products.length;
-        const productsDeleted = productsBeforeDelete - productsAfterDelete;
-
-        addLog(data, user, `Excluiu modelo e produtos associados: ${model.name}`);
-        saveDB(data);
-
-        console.log(`[productModels.delete] ✓ Modelo e ${productsDeleted} produto(s) deletado(s) localmente`);
-        console.log(`[productModels.delete] Exclusão concluída para modelo: ${model.name}`);
-
-        // Retornar resultado da exclusão
+        
+        // Deletar também do localStorage (se existir)
+        const data = loadDB();
+        if (data.productModels) {
+          const localModel = data.productModels.find(m => m.id === id);
+          if (localModel) {
+            modelName = modelName || localModel.name;
+            data.productModels = data.productModels.filter(m => m.id !== id);
+            data.products = (data.products || []).filter(p => p.modelId !== id && p.modelName !== modelName);
+            addLog(data, user, `Excluiu modelo e produtos associados: ${modelName}`);
+            saveDB(data);
+            console.log(`[productModels.delete] ✓ Modelo removido do localStorage`);
+          }
+        }
+        
+        console.log(`[productModels.delete] ✓ Exclusão concluída. ${supabaseDeletedCount} produtos deletados no Supabase`);
+        
         return {
           success: true,
-          modelName: model.name,
-          localProductsDeleted: productsDeleted,
+          modelName: modelName || id,
           supabaseProductsDeleted: supabaseDeletedCount,
           supabaseErrors: supabaseErrorCount > 0 ? supabaseErrors : null
         };
       } catch (error) {
         console.error('[productModels.delete] Erro ao excluir modelo:', error);
-        throw error; // Re-lançar erro para ser capturado pelo handleDeleteModel
+        throw error;
       }
     }
   },
   sales: {
-    list: () => loadDB().sales.sort((a, b) => new Date(b.sale_date) - new Date(a.sale_date)),
-    listFinalized: () => loadDB().sales.filter(s => s.status === 'finalized' || !s.status).sort((a, b) => new Date(b.sale_date) - new Date(a.sale_date)),
-    listCancelled: () => loadDB().sales.filter(s => s.status === 'cancelled').sort((a, b) => new Date(b.sale_date) - new Date(a.sale_date)),
-    create: (sale, user) => {
-      const data = loadDB();
+    list: async () => {
+      const data = await loadDB();
+      return (data.sales || []).sort((a, b) => new Date(b.sale_date) - new Date(a.sale_date));
+    },
+    listFinalized: async () => {
+      const data = await loadDB();
+      return (data.sales || []).filter(s => s.status === 'finalized' || !s.status).sort((a, b) => new Date(b.sale_date) - new Date(a.sale_date));
+    },
+    listCancelled: async () => {
+      const data = await loadDB();
+      return (data.sales || []).filter(s => s.status === 'cancelled').sort((a, b) => new Date(b.sale_date) - new Date(a.sale_date));
+    },
+    create: async (sale, user) => {
+      const data = await loadDB();
       const newSale = { 
         ...sale, 
         id: sale.id || crypto.randomUUID(),
@@ -972,77 +1047,97 @@ export const db = {
       return newSale;
     },
     cancel: async (id, password, user) => {
-      const data = loadDB();
-      const sale = data.sales.find(s => s.id === id);
-      if (!sale) return { success: false, message: 'Venda não encontrada' };
-
-      // Verificar se já está cancelada
-      if (sale.status === 'cancelled') {
-        return { success: false, message: 'Venda já está cancelada' };
-      }
-
-      // Nova regra: a validação de senha já foi feita fora (Supabase).
-      // Aqui apenas garantimos que o usuário que chegou é autorizado por função.
+      // Validar permissão
       if (!user || !(user.role === 'admin' || user.role === 'gerente' || user.role === 'goodadmin')) {
         return { success: false, message: 'Apenas gerente, admin ou goodadmin podem cancelar vendas.' };
       }
 
-      // Estornar estoque (local + Supabase)
-      const sdb = await loadSupabaseDB();
-      for (const item of (sale.items || [])) {
-        // Local: atualizar ambos os campos
-        const pIndex = data.products.findIndex(p => p.id === item.product_id);
-        if (pIndex > -1) {
-          const currentStock = data.products[pIndex].stock !== undefined && data.products[pIndex].stock !== null
-            ? data.products[pIndex].stock
-            : (data.products[pIndex].stock_quantity || 0);
-          const newStock = currentStock + (item.quantity || 0);
-          data.products[pIndex].stock = newStock;
-          data.products[pIndex].stock_quantity = newStock;
+      try {
+        const { supabase } = await import('./supabaseClient.js');
+        
+        // 1. Buscar a venda ANTES de cancelar (para pegar os items)
+        const { data: sale, error: fetchError } = await supabase
+          .from('sales')
+          .select('items, status')
+          .eq('id', id)
+          .single();
+        
+        if (fetchError) {
+          console.error('[db.sales.cancel] Erro ao buscar venda:', fetchError);
+          return { success: false, message: 'Venda não encontrada' };
         }
-
-        // Supabase: buscar produto e incrementar estoque
-        if (sdb) {
-          try {
-            let supaProduct = null;
-            if (item.product_id) {
-              supaProduct = await sdb.products.findById(item.product_id);
+        
+        if (sale.status === 'cancelled') {
+          return { success: false, message: 'Venda já está cancelada' };
+        }
+        
+        // 2. Cancelar a venda (muda status para 'cancelled')
+        const { error: updateError } = await supabase
+          .from('sales')
+          .update({ status: 'cancelled' })
+          .eq('id', id);
+        
+        if (updateError) {
+          console.error('[db.sales.cancel] Erro ao cancelar:', updateError);
+          return { success: false, message: updateError.message };
+        }
+        
+        console.log('[db.sales.cancel] ✅ Venda cancelada no Supabase');
+        
+        // 3. ESTORNAR ESTOQUE no Supabase
+        if (sale && sale.items && Array.isArray(sale.items)) {
+          for (const item of sale.items) {
+            const productId = item.product_id || item.pid;
+            const quantity = item.quantity || item.qtd || 1;
+            
+            if (!productId) continue;
+            
+            try {
+              // Buscar estoque atual
+              const { data: product, error: prodError } = await supabase
+                .from('products')
+                .select('stock_quantity, name')
+                .eq('id', productId)
+                .single();
+              
+              if (prodError) {
+                console.error('[db.sales.cancel] Erro ao buscar produto:', productId, prodError.message);
+                continue;
+              }
+              
+              if (product) {
+                const oldStock = product.stock_quantity || 0;
+                const newStock = oldStock + quantity;
+                
+                const { error: stockError } = await supabase
+                  .from('products')
+                  .update({ stock: newStock, stock_quantity: newStock })
+                  .eq('id', productId);
+                
+                if (stockError) {
+                  console.error('[db.sales.cancel] Erro ao estornar estoque:', stockError.message);
+                } else {
+                  console.log('[db.sales.cancel] ✅ Estoque estornado:', product.name, oldStock, '->', newStock, '(+' + quantity + ')');
+                }
+              }
+            } catch (err) {
+              console.error('[db.sales.cancel] Erro ao estornar estoque:', err);
             }
-            if (!supaProduct && item.code) {
-              supaProduct = await sdb.products.findByCode(item.code);
-            }
-            if (supaProduct) {
-              const current = supaProduct.stock !== undefined && supaProduct.stock !== null
-                ? supaProduct.stock
-                : (supaProduct.stock_quantity || 0);
-              const newStock = current + (item.quantity || 0);
-              await sdb.products.updateStock(supaProduct.id, newStock, {
-                name: user?.name || 'Sistema',
-                cpf: user?.cpf || '00000000000',
-                role: user?.role || 'admin'
-              });
-            }
-          } catch (err) {
-            console.error('[db.sales.cancel] Erro ao estornar estoque no Supabase:', err);
           }
         }
+        
+        return { success: true, message: 'Venda cancelada com sucesso! Estoque estornado.' };
+        
+      } catch (error) {
+        console.error('[db.sales.cancel] Erro:', error);
+        return { success: false, message: error.message || 'Erro ao cancelar venda' };
       }
-
-      // Marcar como cancelada
-      sale.status = 'cancelled';
-      sale.cancelled_at = new Date().toISOString();
-      sale.cancelled_by = user.name;
-      sale.cancelled_by_cpf = user.cpf;
-
-      addLog(data, user, `Cancelou venda #${id.slice(0, 8)} de R$ ${sale.total_amount.toFixed(2)}`);
-      saveDB(data);
-      return { success: true, message: 'Venda cancelada com sucesso' };
     }
   },
   users: {
-    list: () => loadDB().users,
-    login: (identifier, password, loginType = "auto") => {
-      const users = loadDB().users;
+    list: async () => (await loadDB()).users,
+    login: async (identifier, password, loginType = "auto") => {
+      const users = (await loadDB()).users;
       let user = null;
       
       // Detectar automaticamente se é email ou CPF
@@ -1205,40 +1300,42 @@ export const db = {
     }
   },
   coupons: {
-      list: () => loadDB().coupons,
+      list: () => loadDBLocal().coupons || [],
       create: (coupon, user) => {
-          const data = loadDB();
+          const data = loadDBLocal();
+          if (!data.coupons) data.coupons = [];
           data.coupons.push({ ...coupon, id: crypto.randomUUID() });
           addLog(data, user, `Criou cupom: ${coupon.code}`);
-          saveDB(data);
+          saveDBLocal(data);
       },
       delete: (id, user) => {
-          const data = loadDB();
+          const data = loadDBLocal();
+          if (!data.coupons) return;
           data.coupons = data.coupons.filter(c => c.id !== id);
           addLog(data, user, "Removeu cupom");
-          saveDB(data);
+          saveDBLocal(data);
       }
   },
   logs: {
-      list: () => loadDB().logs
+      list: () => loadDBLocal().logs
   },
   settings: {
     get: () => {
-      const data = loadDB();
+      const data = loadDBLocal();
       return data.settings || { cnpj: "", shopifyApiKey: "", shopifyWebhookUrl: "" };
     },
     update: (updates, user) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.settings) data.settings = { cnpj: "", shopifyApiKey: "", shopifyWebhookUrl: "" };
       data.settings = { ...data.settings, ...updates };
       addLog(data, user, "Atualizou configurações gerais");
-      saveDB(data);
+      saveDBLocal(data);
     }
   },
   onlineOrders: {
-    list: () => loadDB().onlineOrders || [],
+    list: () => loadDBLocal().onlineOrders || [],
     create: (order, user) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.onlineOrders) data.onlineOrders = [];
       const newOrder = {
         id: crypto.randomUUID(),
@@ -1248,31 +1345,31 @@ export const db = {
       };
       data.onlineOrders.unshift(newOrder);
       addLog(data, user, `Pedido online recebido: ${order.customerName} - ${order.orderNumber || order.id}`);
-      saveDB(data);
+      saveDBLocal(data);
       return newOrder;
     },
     update: async (id, updates, user) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.onlineOrders) return;
       const index = data.onlineOrders.findIndex(o => o.id === id);
       if (index > -1) {
         data.onlineOrders[index] = { ...data.onlineOrders[index], ...updates };
         addLog(data, user, `Atualizou pedido online: ${data.onlineOrders[index].orderNumber || id}`);
-        saveDB(data);
+        saveDBLocal(data);
       }
     },
     delete: (id, user) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.onlineOrders) return;
       data.onlineOrders = data.onlineOrders.filter(o => o.id !== id);
       addLog(data, user, "Removeu pedido online");
-      saveDB(data);
+      saveDBLocal(data);
     }
   },
   expenses: {
-    list: () => loadDB().expenses || [],
+    list: () => loadDBLocal().expenses || [],
     create: (expense, user) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.expenses) data.expenses = [];
       const newExpense = {
         ...expense,
@@ -1282,35 +1379,35 @@ export const db = {
       };
       data.expenses.push(newExpense);
       addLog(data, user, `Adicionou despesa: ${expense.description} - R$ ${expense.amount.toFixed(2)}`);
-      saveDB(data);
+      saveDBLocal(data);
       return newExpense;
     },
     update: async (id, updates, user) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.expenses) return null;
       const index = data.expenses.findIndex(e => e.id === id);
       if (index > -1) {
         data.expenses[index] = { ...data.expenses[index], ...updates };
         addLog(data, user, `Atualizou despesa: ${updates.description || data.expenses[index].description}`);
-        saveDB(data);
+        saveDBLocal(data);
         return data.expenses[index];
       }
       return null;
     },
     delete: (id, user) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.expenses) return false;
       const expense = data.expenses.find(e => e.id === id);
       if (expense) {
         data.expenses = data.expenses.filter(e => e.id !== id);
         addLog(data, user, `Removeu despesa: ${expense.description}`);
-        saveDB(data);
+        saveDBLocal(data);
         return true;
       }
       return false;
     },
     getTotalByMonth: (year, month) => {
-      const expenses = loadDB().expenses || [];
+      const expenses = loadDBLocal().expenses || [];
       return expenses
         .filter(e => {
           const date = new Date(e.date);
@@ -1320,9 +1417,9 @@ export const db = {
     }
   },
   closures: {
-    list: () => loadDB().closures || [],
+    list: () => loadDBLocal().closures || [],
     getByDate: (date) => {
-      const closures = loadDB().closures || [];
+      const closures = loadDBLocal().closures || [];
       const targetDate = new Date(date).toISOString().split('T')[0];
       return closures.find(c => {
         const closureDate = new Date(c.date).toISOString().split('T')[0];
@@ -1330,7 +1427,7 @@ export const db = {
       });
     },
     create: (closure, user) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.closures) data.closures = [];
       const newClosure = {
         ...closure,
@@ -1341,18 +1438,18 @@ export const db = {
       };
       data.closures.push(newClosure);
       addLog(data, user, `Fechou caixa do dia ${new Date(closure.date).toLocaleDateString('pt-BR')}`);
-      saveDB(data);
+      saveDBLocal(data);
       return newClosure;
     },
     getById: (id) => {
-      const closures = loadDB().closures || [];
+      const closures = loadDBLocal().closures || [];
       return closures.find(c => c.id === id);
     }
   },
   cashOpenings: {
-    list: () => loadDB().cashOpenings || [],
+    list: () => loadDBLocal().cashOpenings || [],
     getByDate: (date) => {
-      const openings = loadDB().cashOpenings || [];
+      const openings = loadDBLocal().cashOpenings || [];
       const targetDate = new Date(date).toISOString().split('T')[0];
       return openings.find(o => {
         const openingDate = new Date(o.date).toISOString().split('T')[0];
@@ -1360,7 +1457,7 @@ export const db = {
       });
     },
     create: (opening, user) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.cashOpenings) data.cashOpenings = [];
       const newOpening = {
         ...opening,
@@ -1371,37 +1468,37 @@ export const db = {
       };
       data.cashOpenings.push(newOpening);
       addLog(data, user, `Abriu caixa do dia ${new Date(opening.date).toLocaleDateString('pt-BR')} com R$ ${opening.amount.toFixed(2)}`);
-      saveDB(data);
+      saveDBLocal(data);
       return newOpening;
     },
     update: async (id, updates, user) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.cashOpenings) return;
       const index = data.cashOpenings.findIndex(o => o.id === id);
       if (index > -1) {
         data.cashOpenings[index] = { ...data.cashOpenings[index], ...updates };
         addLog(data, user, `Atualizou abertura de caixa`);
-        saveDB(data);
+        saveDBLocal(data);
       }
     },
     getById: (id) => {
-      const openings = loadDB().cashOpenings || [];
+      const openings = loadDBLocal().cashOpenings || [];
       return openings.find(o => o.id === id);
     }
   },
   subscriptions: {
     list: () => {
       const tenantId = getCurrentTenantId();
-      const subscriptions = loadDB().subscriptions || [];
+      const subscriptions = loadDBLocal().subscriptions || [];
       // Retornar apenas assinaturas do tenant atual
       return subscriptions.filter(s => s.tenantId === tenantId || (!s.tenantId && !tenantId));
     },
     getByTenantId: (tenantId) => {
-      const subscriptions = loadDB().subscriptions || [];
+      const subscriptions = loadDBLocal().subscriptions || [];
       return subscriptions.find(s => s.tenantId === tenantId);
     },
     create: (subscription) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.subscriptions) data.subscriptions = [];
       const newSubscription = {
         ...subscription,
@@ -1410,20 +1507,20 @@ export const db = {
         active: true
       };
       data.subscriptions.push(newSubscription);
-      saveDB(data);
+      saveDBLocal(data);
       return newSubscription;
     },
     update: (id, updates) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.subscriptions) return;
       const index = data.subscriptions.findIndex(s => s.id === id);
       if (index > -1) {
         data.subscriptions[index] = { ...data.subscriptions[index], ...updates };
-        saveDB(data);
+        saveDBLocal(data);
       }
     },
     getActiveUsersCount: (tenantId) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       const users = data.users || [];
       return users.filter(u => 
         (u.tenantId === tenantId || (!u.tenantId && tenantId === 'default')) && 
@@ -1441,9 +1538,9 @@ export const db = {
     }
   },
   pendingRegistrations: {
-    list: () => loadDB().pendingRegistrations || [],
+    list: () => loadDBLocal().pendingRegistrations || [],
     create: (registration) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.pendingRegistrations) data.pendingRegistrations = [];
       const newRegistration = {
         ...registration,
@@ -1452,20 +1549,20 @@ export const db = {
         status: 'pending_payment'
       };
       data.pendingRegistrations.push(newRegistration);
-      saveDB(data);
+      saveDBLocal(data);
       return newRegistration;
     },
     update: (id, updates) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.pendingRegistrations) return;
       const index = data.pendingRegistrations.findIndex(r => r.id === id);
       if (index > -1) {
         data.pendingRegistrations[index] = { ...data.pendingRegistrations[index], ...updates };
-        saveDB(data);
+        saveDBLocal(data);
       }
     },
     approve: (id) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.pendingRegistrations) return null;
       const registration = data.pendingRegistrations.find(r => r.id === id);
       if (!registration) return null;
@@ -1503,17 +1600,18 @@ export const db = {
       registration.status = 'approved';
       registration.approvedAt = new Date().toISOString();
       
-      saveDB(data);
+      saveDBLocal(data);
       return { user: newUser, subscription };
     },
     delete: (id) => {
-      const data = loadDB();
+      const data = loadDBLocal();
       if (!data.pendingRegistrations) return;
       data.pendingRegistrations = data.pendingRegistrations.filter(r => r.id !== id);
-      saveDB(data);
+      saveDBLocal(data);
     }
   }
 };
 
 // Exportar planos
 export const PLANS_CONFIG = PLANS;
+

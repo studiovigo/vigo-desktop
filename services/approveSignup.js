@@ -8,7 +8,7 @@ import { supabase } from './supabaseClient';
  * NOTA: Esta função requer SERVICE_ROLE_KEY. Em produção, use Edge Function.
  * 
  * @param {string} signupId - ID da solicitação
- * @param {Object} signupData - Dados da solicitação (email, password_hash, etc)
+ * @param {Object} signupData - Dados da solicitação (email, password_hashed, etc)
  * @param {string} reviewerId - ID do usuário que está aprovando
  * @returns {Promise<Object>} { success: boolean, message: string, userId?: string }
  */
@@ -52,7 +52,7 @@ export async function approveSignup(signupId, signupData, reviewerId) {
         body: {
           signup_id: signupId,
           email: signupData.email,
-          password: signupData.password_hash,
+          password: signupData.password_hashed || signupData.password_hash, // Compat: BD usa password_hashed
           admin_name: signupData.admin_name,
           store_name: signupData.store_name,
           cpf_cnpj: signupData.cpf_cnpj,
@@ -76,11 +76,12 @@ export async function approveSignup(signupId, signupData, reviewerId) {
     // Se Edge Function falhou ou não existe, usar signUp() como fallback
     if (!newUserId) {
       try {
-        // NOTA: password_hash na verdade contém a senha em texto plano (ver App.jsx linha 144)
+        // NOTA: password_hashed contém a senha em texto plano (BD espera bcrypt, mas ainda aceita texto)
         // Usar signUp para criar o usuário
+        const password = signupData.password_hashed || signupData.password_hash; // Compat: BD usa password_hashed
         const { data: signUpData, error: signUpError } = await supabase.auth.signUp({
           email: signupData.email,
-          password: signupData.password_hash, // Senha em texto plano
+          password: password, // Senha em texto plano
           options: {
             data: {
               admin_name: signupData.admin_name,
